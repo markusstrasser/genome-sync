@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "genome-sync"
+version = "0.1.0"
+description = "Fail-closed synchronization client for verified genome bundles"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Synthoria" }]
+dependencies = []
+
+[project.scripts]
+genome-sync = "genome_sync.cli:main"
+
+[dependency-groups]
+dev = [
+  "pexpect>=4.9",
+  "pytest>=8.3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/genome_sync"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/README.md",
+  "/pyproject.toml",
+  "/src/genome_sync",
+  "/tests",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
