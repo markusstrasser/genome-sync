@@ -20,9 +20,50 @@ genome-sync --help
 This repository currently supports local-path installation. It is not yet
 published to a package index.
 
+## Configure and synchronize
+
+```bash
+B2_APPLICATION_KEY_ID=... B2_APPLICATION_KEY=... \
+  genome-sync setup donor-id
+
+genome-sync
+genome-sync status
+```
+
+Setup preserves the existing destination and `results`, `lab`, or `both`
+preference. Every later interactive sync displays those saved choices. After
+the remote activation records and manifests have been validated, it also shows
+the five largest optional payloads. The prompt accepts comma-separated numbers
+to omit; pressing Enter keeps the previous omission set, and `none` includes
+everything.
+
+Automation can make the same choice explicitly:
+
+```bash
+genome-sync sync --omit-large 1,3 --yes
+genome-sync sync --omit-large none --yes
+```
+
+An omitted payload can be added on any later run. Deselecting one never removes
+an already downloaded copy. `.genome-manifest.json` schema 4 separates the
+validated remote activation from local materialization through
+`materialization`, `omitted_files`, and per-assay
+`local_materialization_complete` fields. Omitted payloads are not included in
+the manifest's `files` map. Activation markers and remote manifests are control
+files: they remain mandatory and cannot be deselected.
+
+The existing security boundary remains in the bundled client: canonical donor
+and relative paths, no-follow destination traversal, private atomic config and
+log writes, OS credential storage, exact B2 prefix checks, activation rollback
+protection, and size/SHA verification before atomic replacement.
+
 ## Development
 
 ```bash
 uv build
 uv run pytest
 ```
+
+The integration suite uses a deterministic local B2 double. It covers saved
+choices, partial-manifest honesty, adding an omitted payload later, and the
+no-delete-on-deselect invariant without contacting Backblaze.
