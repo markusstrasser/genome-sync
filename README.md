@@ -47,10 +47,13 @@ genome-sync sync --omit-large none --yes
 An omitted payload can be added on any later run. Deselecting one never removes
 an already downloaded copy. `.genome-manifest.json` schema 4 separates the
 validated remote activation from local materialization through
-`materialization`, `omitted_files`, and per-assay
+`materialization`, `omitted_files`, `unavailable_files`, and per-assay
 `local_materialization_complete` fields. Omitted payloads are not included in
-the manifest's `files` map. Activation markers and remote manifests are control
-files: they remain mandatory and cannot be deselected.
+the manifest's `files` map. Files carried from a section outside the current
+sync are rehashed before being carried forward; missing or corrupt files move
+to `unavailable_files` and force materialization incomplete. Activation markers
+and remote manifests are control files: they remain mandatory and cannot be
+deselected.
 
 The existing security boundary remains in the bundled client: canonical donor
 and relative paths, no-follow destination traversal, private atomic config and

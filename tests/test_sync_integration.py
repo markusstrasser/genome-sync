@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -40,6 +41,42 @@ def _setup(client: FakeGenomeSync, omit: str) -> subprocess.CompletedProcess[str
 
 def _manifest(client: FakeGenomeSync) -> dict[str, object]:
     return json.loads((client.destination / ".genome-manifest.json").read_text())
+
+
+def _seed_legacy_result_records(client: FakeGenomeSync) -> dict[str, bytes]:
+    contents = {
+        "shortread/results/intact-result.bin": b"intact-result-payload",
+        "shortread/results/corrupt-result.bin": b"corrupt-result-payload",
+        "shortread/results/missing-result.bin": b"missing-result-payload",
+    }
+    manifest_path = client.destination / ".genome-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["schema"] = 3
+    manifest.pop("materialization", None)
+    manifest.pop("omitted_files", None)
+    manifest.pop("unavailable_files", None)
+    for relative, content in contents.items():
+        path = client.destination / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        manifest["files"][relative] = {
+            "size": len(content),
+            "remote_sha1": hashlib.sha1(content, usedforsecurity=False).hexdigest(),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "proof": "activated_plan_sha256_verified",
+        }
+    manifest["active_results"] = {
+        "shortread": {
+            "sample_id": "sample-001",
+            "plan_sha256": "1" * 64,
+            "authorized_at": "2026-07-31T00:00:00Z",
+            "completion_sha256": "2" * 64,
+            "local_path": "shortread/results",
+        }
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    os.chmod(manifest_path, 0o600)
+    return contents
 
 
 @pytest.mark.parametrize(
@@ -247,3 +284,46 @@ def test_repeated_setup_failure_preserves_saved_configuration(
     assert completed.returncode == 1
     assert "Download failed on shortread/lab/payload-1.bin" in completed.stdout
     assert client.config_file.read_bytes() == original_config
+
+
+def test_lab_only_sync_audits_carried_results_and_normalizes_active_record(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _setup(client, "none")
+    contents = _seed_legacy_result_records(client)
+    corrupt_relative = "shortread/results/corrupt-result.bin"
+    missing_relative = "shortread/results/missing-result.bin"
+    intact_relative = "shortread/results/intact-result.bin"
+    (client.destination / corrupt_relative).write_bytes(
+        b"X" * len(contents[corrupt_relative])
+    )
+    (client.destination / missing_relative).unlink()
+
+    completed = _run(client, "sync", "--omit-large", "none", "--yes")
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    manifest = _manifest(client)
+    assert manifest["schema"] == 4
+    active = manifest["active_results"]["shortread"]
+    assert active["remote_activation_validated"] is True
+    assert active["omitted_file_count"] == 0
+    assert active["omitted_bytes"] == 0
+    assert intact_relative in manifest["files"]
+    assert intact_relative not in manifest["unavailable_files"]
+    assert corrupt_relative not in manifest["files"]
+    assert missing_relative not in manifest["files"]
+    assert (
+        manifest["unavailable_files"][corrupt_relative]["reason"]
+        == "local_sha256_mismatch"
+    )
+    assert (
+        manifest["unavailable_files"][missing_relative]["reason"]
+        == "missing_local_file"
+    )
+    assert manifest["materialization"]["complete"] is False
+    assert manifest["materialization"]["unavailable_file_count"] == 2
+    assert active["local_materialization_complete"] is False
+    assert active["unavailable_file_count"] == 2
+    assert active["unavailable_bytes"] == (
+        len(contents[corrupt_relative]) + len(contents[missing_relative])
+    )

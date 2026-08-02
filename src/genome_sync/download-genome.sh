@@ -2387,7 +2387,7 @@ root_lines = [
     "",
     "This index is generated from `.genome-manifest.json`. Its `active_results`",
     "map binds the verified remote activation for each assay. The manifest's",
-    "`materialization` and `omitted_files` fields say which activated bytes are local.",
+    "`materialization`, `omitted_files`, and `unavailable_files` fields say which activated bytes are local.",
     "",
     "| Assay | Sample | Updated | Results plan | Results index |",
     "|---|---|---|---|---|",
@@ -2471,7 +2471,7 @@ for assay, record in sorted(active.items()):
         f"This directory is the assay container for sample `{record['sample_id']}`. Work read-only unless the donor explicitly asks for a local change.",
         "",
         "Read `../.genome-manifest.json` first. Its `active_results` entry identifies the exact plan and local results path. Then read `results/AGENTS.md` for the evidence and interpretation contract and `results/TOC.md` to locate stages.",
-        "The remote activation and the local materialization are separate facts. Check `materialization.complete` and `omitted_files` before claiming a payload is local.",
+        "The remote activation and the local materialization are separate facts. Check `materialization.complete`, `omitted_files`, and `unavailable_files` before claiming a payload is local.",
         "",
         "Treat `lab/` as sequencing evidence, not interpretation. Validate `lab/lab_manifest.json` and `lab/_COMPLETE.json` before relying on it. Never upload donor-specific sequence, variants, genotypes, or findings to a network service without explicit informed permission.",
         "",
@@ -2509,9 +2509,13 @@ manifest_temporary="$TEMP_ROOT/manifest.json"
 "${PY[@]}" - "$manifest_temporary" "$DONOR" "$BUCKET" "$VERIFIED" "$FILTERED" "$OMITTED" "$HASHES" "$DEST_ABS/$MANIFEST" "$ONLY" "$EXCLUDE" "$ACTIVE_RESULTS" "$DEST_ABS" <<'PYEOF' \
   || { say "${R}could not build a complete local manifest${X}"; exit 1; }
 import datetime
+import hashlib
 import json
+import os
+import re
+import stat
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 (
     manifest_path,
@@ -2534,6 +2538,100 @@ def section_of(relative):
     if "/lab/" in relative or relative.endswith("/lab"):
         return "lab"
     return "results"
+
+SHA1_RE = re.compile(r"[0-9a-f]{40}")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+destination_root = Path(location)
+
+def canonical_managed_relative(relative):
+    if (
+        not isinstance(relative, str)
+        or not relative
+        or "\\" in relative
+        or any(character in relative for character in "\x00\n\r\t")
+    ):
+        raise SystemExit(f"existing manifest has a noncanonical managed path: {relative!r}")
+    parsed = PurePosixPath(relative)
+    if (
+        parsed.is_absolute()
+        or parsed.as_posix() != relative
+        or any(part in {"", ".", ".."} for part in parsed.parts)
+    ):
+        raise SystemExit(f"existing manifest has a noncanonical managed path: {relative!r}")
+    return parsed
+
+def normalize_file_record(record, *, relative):
+    if not isinstance(record, dict):
+        raise SystemExit(f"existing file record is malformed: {relative}")
+    size = record.get("size")
+    remote_sha1 = record.get("remote_sha1")
+    sha256 = record.get("sha256")
+    proof = record.get("proof")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise SystemExit(f"existing file size is malformed: {relative}")
+    if remote_sha1 is not None and (
+        not isinstance(remote_sha1, str) or SHA1_RE.fullmatch(remote_sha1) is None
+    ):
+        raise SystemExit(f"existing file SHA-1 is malformed: {relative}")
+    if not isinstance(sha256, str) or SHA256_RE.fullmatch(sha256) is None:
+        raise SystemExit(f"existing file SHA-256 is malformed: {relative}")
+    if not isinstance(proof, str) or not proof:
+        raise SystemExit(f"existing file proof is malformed: {relative}")
+    return {
+        "size": size,
+        "remote_sha1": remote_sha1,
+        "sha256": sha256,
+        "proof": proof,
+    }
+
+def audit_carried_file(relative, record):
+    parsed = canonical_managed_relative(relative)
+    expected = normalize_file_record(record, relative=relative)
+    path = destination_root.joinpath(*parsed.parts)
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return None, {**expected, "reason": "missing_local_file"}
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise SystemExit(f"carried manifest path is not a regular file: {relative}")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened_before = os.fstat(descriptor)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 8 * 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        opened_after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+    if identity(opened_before) != identity(opened_after) or identity(before) != identity(opened_after):
+        raise SystemExit(f"carried local file changed while hashing: {relative}")
+    observed_sha256 = digest.hexdigest()
+    if opened_after.st_size != expected["size"]:
+        return None, {
+            **expected,
+            "reason": "local_size_mismatch",
+            "observed_size": opened_after.st_size,
+            "observed_sha256": observed_sha256,
+        }
+    if observed_sha256 != expected["sha256"]:
+        return None, {
+            **expected,
+            "reason": "local_sha256_mismatch",
+            "observed_size": opened_after.st_size,
+            "observed_sha256": observed_sha256,
+        }
+    return expected, None
 
 requested_sections = {only} if only else {"lab", "results", "ensemble"}
 if exclude:
@@ -2589,11 +2687,30 @@ if existing_path.exists():
 existing_files = existing.get("files", {})
 if not isinstance(existing_files, dict) or any(not isinstance(item, dict) for item in existing_files.values()):
     raise SystemExit("existing local manifest files must be an object of records")
-merged_files = {
+existing_unavailable = existing.get("unavailable_files", {})
+if not isinstance(existing_unavailable, dict) or any(
+    not isinstance(item, dict) for item in existing_unavailable.values()
+):
+    raise SystemExit("existing unavailable_files must be an object of records")
+carried_candidates = {
     relative: record
     for relative, record in existing_files.items()
     if section_of(relative) not in requested_sections
 }
+for relative, record in existing_unavailable.items():
+    if section_of(relative) in requested_sections:
+        continue
+    if relative in carried_candidates:
+        raise SystemExit(f"existing file is both materialized and unavailable: {relative}")
+    carried_candidates[relative] = record
+merged_files = {}
+merged_unavailable = {}
+for relative, record in sorted(carried_candidates.items()):
+    carried, unavailable = audit_carried_file(relative, record)
+    if carried is not None:
+        merged_files[relative] = carried
+    else:
+        merged_unavailable[relative] = unavailable
 merged_files.update(observed)
 
 existing_omitted = existing.get("omitted_files", {})
@@ -2607,6 +2724,12 @@ merged_omitted = {
     if section_of(relative) not in requested_sections
 }
 merged_omitted.update(omitted)
+if (
+    set(merged_files) & set(merged_omitted)
+    or set(merged_files) & set(merged_unavailable)
+    or set(merged_omitted) & set(merged_unavailable)
+):
+    raise SystemExit("materialized, omitted, and unavailable manifest paths must be disjoint")
 
 if "results" in requested_sections:
     active_results = json.load(open(active_results_path, encoding="utf-8"))
@@ -2616,18 +2739,64 @@ else:
     active_results = existing.get("active_results", {})
 if not isinstance(active_results, dict):
     raise SystemExit("active_results must be an object")
-active_results = {assay: dict(record) for assay, record in active_results.items()}
-if "results" in requested_sections:
-    for assay, record in active_results.items():
-        assay_omitted = {
-            relative: omitted_record
-            for relative, omitted_record in omitted.items()
-            if relative.startswith(f"{assay}/results/")
-        }
-        record["remote_activation_validated"] = True
-        record["local_materialization_complete"] = not assay_omitted
-        record["omitted_file_count"] = len(assay_omitted)
-        record["omitted_bytes"] = sum(item["size"] for item in assay_omitted.values())
+normalized_active_results = {}
+root_result_assets = {"AGENTS.md", "CLAUDE.md", "README.md"}
+required_active_fields = {
+    "sample_id",
+    "plan_sha256",
+    "authorized_at",
+    "completion_sha256",
+    "local_path",
+}
+for assay, raw_record in sorted(active_results.items()):
+    if not isinstance(assay, str) or re.fullmatch(r"[A-Za-z0-9._-]+", assay) is None:
+        raise SystemExit(f"active result assay is not canonical: {assay!r}")
+    if not isinstance(raw_record, dict) or not required_active_fields <= set(raw_record):
+        raise SystemExit(f"active result record is malformed for assay {assay}")
+    record = dict(raw_record)
+    if (
+        not isinstance(record["sample_id"], str)
+        or re.fullmatch(r"[A-Za-z0-9._-]+", record["sample_id"]) is None
+        or record["local_path"] != f"{assay}/results"
+    ):
+        raise SystemExit(f"active result identity is malformed for assay {assay}")
+    for field in ("plan_sha256", "completion_sha256"):
+        if not isinstance(record[field], str) or SHA256_RE.fullmatch(record[field]) is None:
+            raise SystemExit(f"active result {field} is malformed for assay {assay}")
+    try:
+        authorized_at = datetime.datetime.fromisoformat(
+            record["authorized_at"].replace("Z", "+00:00")
+        )
+    except (AttributeError, ValueError) as error:
+        raise SystemExit(f"active result authorized_at is malformed for assay {assay}") from error
+    if authorized_at.tzinfo is None or authorized_at.utcoffset() is None:
+        raise SystemExit(f"active result authorized_at lacks a timezone for assay {assay}")
+    remote_activation_validated = record.get("remote_activation_validated", True)
+    if type(remote_activation_validated) is not bool:
+        raise SystemExit(f"active result validation state is malformed for assay {assay}")
+    affects_assay = lambda relative: (
+        relative.startswith(f"{assay}/results/") or relative in root_result_assets
+    )
+    assay_omitted = {
+        relative: omitted_record
+        for relative, omitted_record in merged_omitted.items()
+        if affects_assay(relative)
+    }
+    assay_unavailable = {
+        relative: unavailable_record
+        for relative, unavailable_record in merged_unavailable.items()
+        if affects_assay(relative)
+    }
+    record["remote_activation_validated"] = remote_activation_validated
+    record["local_materialization_complete"] = (
+        remote_activation_validated and not assay_omitted and not assay_unavailable
+    )
+    record["omitted_file_count"] = len(assay_omitted)
+    record["omitted_bytes"] = sum(item["size"] for item in assay_omitted.values())
+    record["unavailable_file_count"] = len(assay_unavailable)
+    record["unavailable_bytes"] = sum(item["size"] for item in assay_unavailable.values())
+    normalized_active_results[assay] = record
+active_results = normalized_active_results
 
 synced_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 section_sync = existing.get("section_sync", {})
@@ -2655,16 +2824,22 @@ payload = {
     ],
     "file_count": len(merged_files),
     "materialization": {
-        "complete": not merged_omitted,
-        "verified_remote_file_count": len(merged_files) + len(merged_omitted),
+        "complete": not merged_omitted and not merged_unavailable,
+        "verified_remote_file_count": (
+            len(merged_files) + len(merged_omitted) + len(merged_unavailable)
+        ),
         "verified_remote_bytes": sum(record["size"] for record in merged_files.values())
-        + sum(record["size"] for record in merged_omitted.values()),
+        + sum(record["size"] for record in merged_omitted.values())
+        + sum(record["size"] for record in merged_unavailable.values()),
         "materialized_file_count": len(merged_files),
         "materialized_bytes": sum(record["size"] for record in merged_files.values()),
         "omitted_file_count": len(merged_omitted),
         "omitted_bytes": sum(record["size"] for record in merged_omitted.values()),
+        "unavailable_file_count": len(merged_unavailable),
+        "unavailable_bytes": sum(record["size"] for record in merged_unavailable.values()),
     },
     "omitted_files": dict(sorted(merged_omitted.items())),
+    "unavailable_files": dict(sorted(merged_unavailable.items())),
     "files": dict(sorted(merged_files.items())),
 }
 with open(manifest_path, "w", encoding="utf-8") as destination:
