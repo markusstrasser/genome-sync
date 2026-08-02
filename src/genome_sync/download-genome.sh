@@ -354,12 +354,35 @@ config_field() {
 }
 
 config_payload=""
+configured_destination=""
+configured_only=""
+configured_exclude=""
+SETUP_REPEATED=0
 case "$COMMAND" in
   setup)
     if [ -z "$DONOR" ] || [ -z "$KEY_ID" ] || [ -z "$APP_KEY" ]; then
       echo "error: setup needs B2_APPLICATION_KEY_ID, B2_APPLICATION_KEY, and <donor>" >&2
       usage >&2
       exit 1
+    fi
+    if [ -e "$CONFIG_FILE" ] || [ -L "$CONFIG_FILE" ]; then
+      config_payload="$(config_read)" || exit 1
+      configured_donor="$(config_field 1)"
+      if [ "$(config_field 6)" != "END" ]; then
+        echo "error: incomplete genome-sync config" >&2
+        exit 1
+      fi
+      if [ "$configured_donor" = "$DONOR" ]; then
+        configured_destination="$(config_field 2)"
+        configured_only="$(config_field 3)"
+        configured_exclude="$(config_field 4)"
+        SAVED_OMITTED_JSON="$(config_field 5)"
+        SETUP_REPEATED=1
+        if [ "$FILTER_EXPLICIT" -eq 0 ]; then
+          ONLY="$configured_only"
+          EXCLUDE="$configured_exclude"
+        fi
+      fi
     fi
     ;;
   sync)
@@ -827,27 +850,34 @@ if [ "$COMMAND" = "sync" ] && [ "$FILTER_EXPLICIT" -eq 0 ] \
   done
 fi
 if [ "$COMMAND" = "setup" ] && [ "$FILTER_EXPLICIT" -eq 0 ]; then
-  selected_section="results"
+  if [ "$SETUP_REPEATED" -eq 0 ]; then
+    ONLY="results"
+    EXCLUDE=""
+    saved_selection="results"
+  else
+    saved_selection="$(selection_label)"
+  fi
   if [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
     while :; do
-      printf "%b" "  Sync results, lab, or both? ${D}[results]${X} " > /dev/tty
-      read -r selected_section < /dev/tty || selected_section="results"
+      printf "%b" "  Sync results, lab, or both? ${D}[${saved_selection}]${X} " > /dev/tty
+      read -r selected_section < /dev/tty || selected_section=""
       case "$selected_section" in
-        ""|results|r) selected_section="results"; break ;;
-        lab|l) selected_section="lab"; break ;;
-        both|b) selected_section="both"; break ;;
+        "") break ;;
+        results|r) ONLY="results"; EXCLUDE=""; break ;;
+        lab|l) ONLY="lab"; EXCLUDE=""; break ;;
+        both|b) ONLY=""; EXCLUDE=""; break ;;
         *) say "  ${Y}Enter results, lab, or both.${X}" ;;
       esac
     done
   fi
-  case "$selected_section" in
-    results|lab) ONLY="$selected_section" ;;
-    both) ONLY="" ;;
-  esac
 fi
 if [ "$DEST_EXPLICIT" -eq 0 ]; then
   if [ "$COMMAND" = "setup" ]; then
-    suggested_destination="${HOME}/Genome/${DONOR}"
+    if [ "$SETUP_REPEATED" -eq 1 ]; then
+      suggested_destination="$configured_destination"
+    else
+      suggested_destination="${HOME}/Genome/${DONOR}"
+    fi
     DEST="$suggested_destination"
     if [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
       printf "%b" "  Save your genome data where? ${D}[${suggested_destination}]${X} " > /dev/tty
@@ -1987,7 +2017,7 @@ for raw_line in open(choices_path, encoding="utf-8"):
 saved = set(json.loads(saved_json))
 normalized = selection_text.strip().lower()
 if normalized == "none":
-    omitted = set()
+    omitted = saved - verified_paths
 else:
     selected_numbers = []
     if normalized:
@@ -2021,18 +2051,9 @@ else
 fi
 log_event "selection selected_files=${selected_file_count} selected_bytes=${selected_bytes} omitted_files=${omitted_file_count} omitted_bytes=${omitted_bytes}"
 
-if [ "$COMMAND" = "setup" ] && [ "$DRYRUN" -eq 0 ]; then
-  GENOME_SYNC_KEY_ID="$KEY_ID" GENOME_SYNC_APPLICATION_KEY="$APP_KEY" \
-    credential_store set "$DONOR" \
-    || { say "\n${R}  Could not store the credential securely.${X}"; exit 1; }
-  if ! config_write "$DONOR" "$DEST_ABS" "$ONLY" "$EXCLUDE" "$SAVED_OMITTED_JSON"; then
-    credential_store delete "$DONOR" >/dev/null 2>&1 || true
-    say "\n${R}  Could not save the genome-sync configuration.${X}"
-    exit 1
-  fi
-  say "  ${G}securely configured future syncs for ${DEST_ABS}${X}"
+if [ "$COMMAND" != "setup" ]; then
+  unset KEY_ID APP_KEY B2_APPLICATION_KEY_ID B2_APPLICATION_KEY
 fi
-unset KEY_ID APP_KEY B2_APPLICATION_KEY_ID B2_APPLICATION_KEY
 
 if [ -n "$(find "$DEST_ABS" -type f ! -path "$DEST_ABS/.genome-download-tmp.*/*" -print -quit 2>/dev/null)" ]; then
   say "  ${D}indexing existing verified content for differential sync${X}"
@@ -2661,11 +2682,23 @@ if [ "$COMMAND" = "setup" ] || [ "$COMMAND" = "sync" ]; then
     preference_only="$configured_only"
     preference_exclude="$configured_exclude"
   fi
+  if [ "$COMMAND" = "setup" ]; then
+    GENOME_SYNC_KEY_ID="$KEY_ID" GENOME_SYNC_APPLICATION_KEY="$APP_KEY" \
+      credential_store set "$DONOR" \
+      || { say "\n${R}  Could not store the credential securely.${X}"; exit 1; }
+  fi
   if ! config_write "$DONOR" "$DEST_ABS" "$preference_only" "$preference_exclude" "$selected_omitted_json"; then
+    if [ "$COMMAND" = "setup" ] && [ "$SETUP_REPEATED" -eq 0 ]; then
+      credential_store delete "$DONOR" >/dev/null 2>&1 || true
+    fi
     say "${Y}  Data synchronized, but the saved large-payload choice could not be updated.${X}"
     exit 1
   fi
+  if [ "$COMMAND" = "setup" ]; then
+    say "  ${G}securely configured future syncs for ${DEST_ABS}${X}"
+  fi
 fi
+unset KEY_ID APP_KEY B2_APPLICATION_KEY_ID B2_APPLICATION_KEY
 
 log_event "finish status=success manifest=${DEST_ABS}/${MANIFEST}"
 persist_log || { say "${Y}  Sync succeeded, but the local log could not be saved.${X}"; }

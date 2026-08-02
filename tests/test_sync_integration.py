@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 
 import pexpect
@@ -167,3 +168,82 @@ def test_deselecting_downloaded_payload_never_deletes_it(
     assert partial["materialization"]["complete"] is False
     assert "shortread/lab/payload-1.bin" in partial["omitted_files"]
     assert "shortread/lab/payload-1.bin" not in partial["files"]
+
+
+def test_include_all_preserves_saved_omissions_outside_current_inventory(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _setup(client, "1")
+    config = json.loads(client.config_file.read_text())
+    outside_current_inventory = "longread/results/huge.cram"
+    config["omitted_large_paths"].append(outside_current_inventory)
+    config["omitted_large_paths"].sort()
+    client.config_file.write_text(json.dumps(config, sort_keys=True) + "\n")
+    os.chmod(client.config_file, 0o600)
+
+    completed = _run(client, "sync", "--omit-large", "none", "--yes")
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    updated = json.loads(client.config_file.read_text())
+    assert updated["omitted_large_paths"] == [outside_current_inventory]
+    assert (
+        client.destination / "shortread" / "lab" / "payload-1.bin"
+    ).read_bytes() == client.payloads["shortread/lab/payload-1.bin"]
+
+
+def test_repeated_setup_prefills_and_commits_only_after_confirmation(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _setup(client, "1")
+    original_config = client.config_file.read_bytes()
+
+    repeated = pexpect.spawn(
+        str(client.command),
+        ["setup", client.donor],
+        env=client.environment,
+        encoding="utf-8",
+        timeout=15,
+    )
+    repeated.expect("Sync results, lab, or both?.*\\[lab only\\]")
+    repeated.sendline("")
+    repeated.expect("Save your genome data where?.*" + re.escape(str(client.destination)))
+    repeated.sendline("")
+    repeated.expect("Largest optional payloads:")
+    repeated.expect("Numbers to omit.*\\[1\\]")
+    repeated.sendline("none")
+    repeated.expect("Apply this verified update?.*\\[Y/n\\]")
+    repeated.sendline("n")
+    repeated.expect("No files changed")
+    repeated.expect(pexpect.EOF)
+    repeated.close()
+    assert repeated.exitstatus == 0
+    assert client.config_file.read_bytes() == original_config
+
+    completed = _run(client, "setup", "--omit-large", "none", "--yes", client.donor)
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    updated = json.loads(client.config_file.read_text())
+    assert updated["destination"] == str(client.destination)
+    assert updated["only"] == "lab"
+    assert updated["omitted_large_paths"] == []
+
+
+def test_repeated_setup_failure_preserves_saved_configuration(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _setup(client, "1")
+    original_config = client.config_file.read_bytes()
+    failing_environment = dict(client.environment)
+    failing_environment["FAKE_B2_FAIL_DOWNLOAD_SUFFIX"] = "payload-1.bin"
+
+    completed = subprocess.run(
+        [client.command, "setup", "--omit-large", "none", "--yes", client.donor],
+        env=failing_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 1
+    assert "Download failed on shortread/lab/payload-1.bin" in completed.stdout
+    assert client.config_file.read_bytes() == original_config

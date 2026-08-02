@@ -129,6 +129,10 @@ if arguments[:2] == ["file", "download"]:
     if not source_uri.startswith(prefix):
         raise SystemExit("fake uvx received the wrong bucket")
     source = remote_root / source_uri.removeprefix(prefix)
+    failure_suffix = os.environ.get("FAKE_B2_FAIL_DOWNLOAD_SUFFIX", "")
+    if failure_suffix and source.as_posix().endswith(failure_suffix):
+        print("injected fake B2 download failure", file=sys.stderr)
+        raise SystemExit(9)
     shutil.copyfile(source, destination)
     raise SystemExit(0)
 raise SystemExit(f"unsupported fake b2 invocation: {arguments!r}")
