@@ -34,6 +34,8 @@ OPTIONS:
   -d, --dest DIR       setup destination (suggested: ~/Genome/<donor>)
       --only WHICH     sync only one of: lab | results | ensemble
       --exclude WHICH  skip one of: lab | results | ensemble
+      --omit-large N   omit numbered optional payloads after inventory validation
+                       (comma-separated, or "none" to include every payload)
   -y, --yes            do not ask for confirmation
   -n, --dry-run        show what would change, then stop
   -h, --help           show this help
@@ -57,8 +59,12 @@ SETUP AND UPDATES:
   setup asks for results, lab, or both (default: results), validates the scoped
   B2 key, stores it in the operating system's secure credential service, and
   remembers the selection, donor, and destination. Later interactive runs show
-  the saved choice, allow a one-run override, download only changed files, and
-  remove previously managed files absent from the new active snapshot.
+  the saved choices, allow a one-run section override, and show the five largest
+  optional payloads before any transfer. Press Enter to reuse the prior omitted
+  payloads, enter comma-separated numbers to change them, or enter "none" to
+  include all of them. Noninteractive callers use --omit-large N (or none).
+  Downloads are differential. Deselecting a payload never deletes a previously
+  downloaded copy; the local manifest records partial materialization explicitly.
   `genome-sync destination <directory>` changes only the saved destination. It
   uses the existing Keychain/Credential Locker entry and never moves or syncs
   files; the directory must already exist.
@@ -70,13 +76,21 @@ COMMAND=""
 case "${1:-}" in
   setup|sync|status|destination) COMMAND="$1"; shift ;;
 esac
-DEST=""; DEST_EXPLICIT=0; ONLY=""; EXCLUDE=""; FILTER_EXPLICIT=0; DRYRUN=0; ASSUME_YES=0; POS=()
+DEST=""; DEST_EXPLICIT=0; ONLY=""; EXCLUDE=""; FILTER_EXPLICIT=0
+OMIT_LARGE_SPEC=""; OMIT_LARGE_EXPLICIT=0; SAVED_OMITTED_JSON="[]"
+DRYRUN=0; ASSUME_YES=0; POS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     -d|--dest) DEST="${2:?--dest needs a directory}"; DEST_EXPLICIT=1; shift 2 ;;
     --only) ONLY="${2:?--only needs lab|results|ensemble}"; FILTER_EXPLICIT=1; shift 2 ;;
     --exclude) EXCLUDE="${2:?--exclude needs lab|results|ensemble}"; FILTER_EXPLICIT=1; shift 2 ;;
+    --omit-large)
+      [ "$OMIT_LARGE_EXPLICIT" -eq 0 ] || { echo "error: --omit-large may be given only once" >&2; exit 1; }
+      OMIT_LARGE_SPEC="${2:?--omit-large needs comma-separated numbers or none}"
+      OMIT_LARGE_EXPLICIT=1
+      shift 2
+      ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     -n|--dry-run) DRYRUN=1; shift ;;
     --) shift; while [ $# -gt 0 ]; do POS+=("$1"); shift; done ;;
@@ -149,12 +163,14 @@ try:
     payload = json.loads(path.read_text(encoding="utf-8"))
 except (OSError, ValueError) as error:
     raise SystemExit(f"invalid genome-sync config: {error}") from error
-if payload.get("schema_version") != "genome-sync-config/v2":
+schema_version = payload.get("schema_version")
+if schema_version not in {"genome-sync-config/v2", "genome-sync-config/v3"}:
     raise SystemExit("unsupported genome-sync config schema")
 donor = payload.get("donor")
 destination = payload.get("destination")
 only = payload.get("only", "")
 exclude = payload.get("exclude", "")
+omitted_large_paths = payload.get("omitted_large_paths", [])
 if not isinstance(donor, str) or not donor or donor in {".", ".."} or any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-" for character in donor):
     raise SystemExit("invalid donor in genome-sync config")
 if not isinstance(destination, str) or not os.path.isabs(destination) or any(character in destination for character in "\n\r\t"):
@@ -163,10 +179,25 @@ if only not in {"", "lab", "results", "ensemble"} or exclude not in {"", "lab", 
     raise SystemExit("invalid section selection in genome-sync config")
 if only and exclude:
     raise SystemExit("genome-sync config cannot combine only and exclude")
+if (
+    not isinstance(omitted_large_paths, list)
+    or omitted_large_paths != sorted(set(omitted_large_paths))
+    or any(
+        not isinstance(relative, str)
+        or not relative
+        or "\\" in relative
+        or any(character in relative for character in "\x00\n\r\t")
+        or relative.startswith("/")
+        or any(part in {"", ".", ".."} for part in relative.split("/"))
+        for relative in omitted_large_paths
+    )
+):
+    raise SystemExit("invalid omitted large-payload paths in genome-sync config")
 print(donor)
 print(destination)
 print(only)
 print(exclude)
+print(json.dumps(omitted_large_paths, separators=(",", ":")))
 print("END", end="")
 PYEOF
 }
@@ -176,7 +207,8 @@ config_write() {
   local destination="$2"
   local only="$3"
   local exclude="$4"
-  "${PY[@]}" - "$CONFIG_ROOT" "$CONFIG_FILE" "$donor" "$destination" "$only" "$exclude" <<'PYEOF'
+  local omitted_large_json="${5:-[]}"
+  "${PY[@]}" - "$CONFIG_ROOT" "$CONFIG_FILE" "$donor" "$destination" "$only" "$exclude" "$omitted_large_json" <<'PYEOF'
 import json
 import os
 import stat
@@ -190,6 +222,16 @@ donor = sys.argv[3]
 destination = sys.argv[4]
 only = sys.argv[5]
 exclude = sys.argv[6]
+try:
+    omitted_large_paths = json.loads(sys.argv[7])
+except json.JSONDecodeError as error:
+    raise SystemExit(f"invalid omitted large-payload selection: {error}") from error
+if (
+    not isinstance(omitted_large_paths, list)
+    or omitted_large_paths != sorted(set(omitted_large_paths))
+    or any(not isinstance(relative, str) or not relative for relative in omitted_large_paths)
+):
+    raise SystemExit("omitted large-payload selection must be canonical sorted paths")
 if root.exists():
     observed = root.lstat()
     if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
@@ -202,11 +244,12 @@ try:
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         json.dump(
             {
-                "schema_version": "genome-sync-config/v2",
+                "schema_version": "genome-sync-config/v3",
                 "donor": donor,
                 "destination": destination,
                 "only": only,
                 "exclude": exclude,
+                "omitted_large_paths": omitted_large_paths,
             },
             handle,
             sort_keys=True,
@@ -333,7 +376,8 @@ case "$COMMAND" in
     DEST="$(config_field 2)"
     configured_only="$(config_field 3)"
     configured_exclude="$(config_field 4)"
-    if [ "$(config_field 5)" != "END" ]; then
+    SAVED_OMITTED_JSON="$(config_field 5)"
+    if [ "$(config_field 6)" != "END" ]; then
       echo "error: incomplete genome-sync config" >&2
       exit 1
     fi
@@ -348,7 +392,8 @@ case "$COMMAND" in
     unset credential_payload
     ;;
   status)
-    if [ -n "$DONOR" ] || [ "$DEST_EXPLICIT" -eq 1 ] || [ -n "$ONLY" ] || [ -n "$EXCLUDE" ] || [ "$DRYRUN" -eq 1 ]; then
+    if [ -n "$DONOR" ] || [ "$DEST_EXPLICIT" -eq 1 ] || [ -n "$ONLY" ] || [ -n "$EXCLUDE" ] \
+      || [ "$OMIT_LARGE_EXPLICIT" -eq 1 ] || [ "$DRYRUN" -eq 1 ]; then
       echo "error: status accepts no donor or sync options" >&2
       exit 1
     fi
@@ -357,7 +402,8 @@ case "$COMMAND" in
     DEST="$(config_field 2)"
     configured_only="$(config_field 3)"
     configured_exclude="$(config_field 4)"
-    if [ "$(config_field 5)" != "END" ]; then
+    SAVED_OMITTED_JSON="$(config_field 5)"
+    if [ "$(config_field 6)" != "END" ]; then
       echo "error: incomplete genome-sync config" >&2
       exit 1
     fi
@@ -369,6 +415,7 @@ case "$COMMAND" in
       configured_selection="results and lab"
     fi
     printf 'donor=%s\ndestination=%s\ndefault_selection=%s\n' "$DONOR" "$DEST" "$configured_selection"
+    printf 'omitted_large_paths=%s\n' "$SAVED_OMITTED_JSON"
     credential_store status "$DONOR" || exit 1
     if [ -f "$DEST/$MANIFEST" ]; then
       printf 'local_manifest=%s\n' "$DEST/$MANIFEST"
@@ -380,7 +427,8 @@ case "$COMMAND" in
     ;;
   destination)
     if [ -z "$DONOR" ] || [ "$DEST_EXPLICIT" -eq 1 ] || [ -n "$ONLY" ] \
-      || [ -n "$EXCLUDE" ] || [ "$DRYRUN" -eq 1 ] || [ "$ASSUME_YES" -eq 1 ]; then
+      || [ -n "$EXCLUDE" ] || [ "$OMIT_LARGE_EXPLICIT" -eq 1 ] \
+      || [ "$DRYRUN" -eq 1 ] || [ "$ASSUME_YES" -eq 1 ]; then
       echo "error: usage: genome-sync destination <directory>" >&2
       exit 1
     fi
@@ -390,7 +438,8 @@ case "$COMMAND" in
     configured_destination="$(config_field 2)"
     ONLY="$(config_field 3)"
     EXCLUDE="$(config_field 4)"
-    if [ "$(config_field 5)" != "END" ]; then
+    SAVED_OMITTED_JSON="$(config_field 5)"
+    if [ "$(config_field 6)" != "END" ]; then
       echo "error: incomplete genome-sync config" >&2
       exit 1
     fi
@@ -826,7 +875,7 @@ if [ "$COMMAND" = "destination" ]; then
     echo "error: $DEST_ABS belongs to donor $existing_donor, not $DONOR" >&2
     exit 1
   fi
-  if ! config_write "$DONOR" "$DEST_ABS" "$ONLY" "$EXCLUDE"; then
+  if ! config_write "$DONOR" "$DEST_ABS" "$ONLY" "$EXCLUDE" "$SAVED_OMITTED_JSON"; then
     echo "error: could not save the new genome-sync destination" >&2
     exit 1
   fi
@@ -860,7 +909,11 @@ chmod 700 "$CONTROL_DIR"
 TEMP_ROOT="$(mktemp -d "${DEST_ABS}/.genome-download-tmp.XXXXXX")" || exit 1
 chmod 700 "$TEMP_ROOT"
 RAWJSON="$CONTROL_DIR/remote.json"
+VERIFIED="$CONTROL_DIR/verified.tsv"
 FILTERED="$CONTROL_DIR/filtered.tsv"
+LARGE_CHOICES="$CONTROL_DIR/large-choices.tsv"
+OMITTED="$CONTROL_DIR/omitted.tsv"
+OMITTED_JSON_FILE="$CONTROL_DIR/omitted-large-paths.json"
 TODO="$CONTROL_DIR/todo.tsv"
 PRUNES="$CONTROL_DIR/prunes.txt"
 RELS="$CONTROL_DIR/remote-rels.txt"
@@ -868,8 +921,9 @@ HASHES="$CONTROL_DIR/local-hashes.tsv"
 ACTIVE_RESULTS="$CONTROL_DIR/active-results.json"
 LOCAL_INDEX="$CONTROL_DIR/local-content-index.tsv"
 SESSION_LOG="$CONTROL_DIR/sync.log"
-touch "$TODO" "$PRUNES" "$HASHES" "$LOCAL_INDEX"
+touch "$VERIFIED" "$FILTERED" "$LARGE_CHOICES" "$OMITTED" "$TODO" "$PRUNES" "$HASHES" "$LOCAL_INDEX"
 printf '{}\n' > "$ACTIVE_RESULTS"
+printf '%s\n' "$SAVED_OMITTED_JSON" > "$OMITTED_JSON_FILE"
 LOG_PERSISTED=0
 download_process_id=""
 log_event() {
@@ -946,7 +1000,7 @@ say "  ${D}Connected with verified B2 client ${B2_VERSION}.${X}"
 "${B2_RUN[@]}" ls --recursive --json "b2://${BUCKET}/${DONOR}/" > "$RAWJSON" \
   || { say "\n${R}  Could not list your files.${X}"; exit 1; }
 
-"${PY[@]}" - "$RAWJSON" "$DONOR" "$ONLY" "$EXCLUDE" "$BUCKET" "$CONTROL_DIR" "$B2_VERSION" "$DEST_ABS" "$ACTIVE_RESULTS" <<'PYEOF' > "$FILTERED" \
+"${PY[@]}" - "$RAWJSON" "$DONOR" "$ONLY" "$EXCLUDE" "$BUCKET" "$CONTROL_DIR" "$B2_VERSION" "$DEST_ABS" "$ACTIVE_RESULTS" <<'PYEOF' > "$VERIFIED" \
   || { say "\n${R}  The remote listing or activation evidence violated the donor contract.${X}"; exit 1; }
 import hashlib
 import json
@@ -1807,22 +1861,9 @@ for remote, expected_sha256, local_relative in sorted(
     )
 PYEOF
 
-if [ "$COMMAND" = "setup" ] && [ "$DRYRUN" -eq 0 ]; then
-  GENOME_SYNC_KEY_ID="$KEY_ID" GENOME_SYNC_APPLICATION_KEY="$APP_KEY" \
-    credential_store set "$DONOR" \
-    || { say "\n${R}  Could not store the credential securely.${X}"; exit 1; }
-  if ! config_write "$DONOR" "$DEST_ABS" "$ONLY" "$EXCLUDE"; then
-    credential_store delete "$DONOR" >/dev/null 2>&1 || true
-    say "\n${R}  Could not save the genome-sync configuration.${X}"
-    exit 1
-  fi
-  say "  ${G}securely configured future syncs for ${DEST_ABS}${X}"
-fi
-unset KEY_ID APP_KEY B2_APPLICATION_KEY_ID B2_APPLICATION_KEY
-
-remote_file_count=$(wc -l < "$FILTERED" | tr -d ' ')
-remote_bytes=$(awk -F '\t' '{total += $2} END {printf "%.0f", total}' "$FILTERED")
-say "  ${G}Verified remote snapshot:${X} ${remote_file_count} files, $(human "$remote_bytes")"
+verified_file_count=$(wc -l < "$VERIFIED" | tr -d ' ')
+verified_bytes=$(awk -F '\t' '{total += $2} END {printf "%.0f", total}' "$VERIFIED")
+say "  ${G}Verified remote snapshot:${X} ${verified_file_count} files, $(human "$verified_bytes")"
 if [ "$(tr -d '[:space:]' < "$ACTIVE_RESULTS")" != "{}" ]; then
   "${PY[@]}" - "$ACTIVE_RESULTS" <<'PYEOF'
 import json
@@ -1836,8 +1877,162 @@ for assay, record in sorted(active.items()):
     )
 PYEOF
 fi
-awk -F '\t' '$5 ~ /\/lab\/lab_manifest\.json$/ {printf "    lab · %s · plan %s\n", $5, substr($3, 1, 12)}' "$FILTERED"
-log_event "verified remote_files=${remote_file_count} remote_bytes=${remote_bytes}"
+awk -F '\t' '$5 ~ /\/lab\/lab_manifest\.json$/ {printf "    lab · %s · plan %s\n", $5, substr($3, 1, 12)}' "$VERIFIED"
+log_event "verified remote_files=${verified_file_count} remote_bytes=${verified_bytes}"
+
+"${PY[@]}" - "$VERIFIED" "$SAVED_OMITTED_JSON" "$LARGE_CHOICES" <<'PYEOF' \
+  || { say "${R}could not rank optional payloads${X}"; exit 1; }
+import json
+import sys
+
+verified_path, saved_json, choices_path = sys.argv[1:]
+try:
+    saved = set(json.loads(saved_json))
+except (TypeError, ValueError) as error:
+    raise SystemExit(f"invalid saved large-payload selection: {error}") from error
+
+rows = []
+for raw_line in open(verified_path, encoding="utf-8"):
+    fields = raw_line.rstrip("\n").split("\t")
+    if len(fields) != 5:
+        raise SystemExit("verified remote row is malformed")
+    rows.append((int(fields[1]), fields[4]))
+
+def is_control(relative):
+    if relative in {"AGENTS.md", "CLAUDE.md", "README.md"}:
+        return True
+    parts = relative.split("/")
+    return (
+        len(parts) == 3
+        and parts[1] in {"lab", "results"}
+        and parts[2] in {"_COMPLETE.json", "lab_manifest.json", "manifest.json"}
+    )
+
+payloads = sorted(
+    ((size, relative) for size, relative in rows if not is_control(relative)),
+    key=lambda item: (-item[0], item[1]),
+)
+largest = payloads[:5]
+largest_paths = {relative for _size, relative in largest}
+saved_extras = sorted(
+    ((size, relative) for size, relative in payloads if relative in saved and relative not in largest_paths),
+    key=lambda item: item[1],
+)
+with open(choices_path, "w", encoding="utf-8") as destination:
+    for index, (size, relative) in enumerate([*largest, *saved_extras], start=1):
+        state = "omit" if relative in saved else "include"
+        source = "largest" if relative in largest_paths else "saved"
+        print(index, state, size, relative, source, sep="\t", file=destination)
+PYEOF
+
+omit_spec="$OMIT_LARGE_SPEC"
+saved_omit_numbers="$(awk -F '\t' '$2 == "omit" {values = values separator $1; separator = ","} END {print values}' "$LARGE_CHOICES")"
+if [ -s "$LARGE_CHOICES" ]; then
+  say "\n  ${B}Largest optional payloads:${X}"
+  while IFS=$'\t' read -r choice_number choice_state choice_size choice_path choice_source; do
+    choice_marker="include"
+    [ "$choice_state" = "omit" ] && choice_marker="omit"
+    choice_note=""
+    [ "$choice_source" = "saved" ] && choice_note=" · saved prior omission"
+    say "    ${B}${choice_number}.${X} [${choice_marker}] $(human "$choice_size") · ${choice_path}${D}${choice_note}${X}"
+  done < "$LARGE_CHOICES"
+  if [ "$OMIT_LARGE_EXPLICIT" -eq 0 ]; then
+    omit_spec="$saved_omit_numbers"
+    if [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
+      shown_default="$saved_omit_numbers"
+      [ -n "$shown_default" ] || shown_default="none"
+      printf "%b" "  Numbers to omit ${D}[${shown_default}]${X} (none = include all) " > /dev/tty
+      read -r entered_omissions < /dev/tty || entered_omissions=""
+      if [ -n "$entered_omissions" ]; then
+        omit_spec="$entered_omissions"
+      fi
+    fi
+  fi
+elif [ "$OMIT_LARGE_EXPLICIT" -eq 1 ] && [ "$OMIT_LARGE_SPEC" != "none" ]; then
+  say "${R}--omit-large selected numbered payloads, but no optional payloads are available${X}"
+  exit 1
+fi
+
+"${PY[@]}" - "$VERIFIED" "$LARGE_CHOICES" "$omit_spec" "$SAVED_OMITTED_JSON" \
+  "$FILTERED" "$OMITTED" "$OMITTED_JSON_FILE" <<'PYEOF' \
+  || { say "${R}invalid large-payload selection${X}"; exit 1; }
+import json
+import sys
+
+(
+    verified_path,
+    choices_path,
+    selection_text,
+    saved_json,
+    filtered_path,
+    omitted_path,
+    omitted_json_path,
+) = sys.argv[1:]
+
+verified_rows = []
+for raw_line in open(verified_path, encoding="utf-8"):
+    fields = raw_line.rstrip("\n").split("\t")
+    if len(fields) != 5:
+        raise SystemExit("verified remote row is malformed")
+    verified_rows.append(fields)
+verified_paths = {fields[4] for fields in verified_rows}
+
+choices = {}
+for raw_line in open(choices_path, encoding="utf-8"):
+    fields = raw_line.rstrip("\n").split("\t")
+    if len(fields) != 5:
+        raise SystemExit("large-payload choice row is malformed")
+    choices[fields[0]] = fields[3]
+
+saved = set(json.loads(saved_json))
+normalized = selection_text.strip().lower()
+if normalized == "none":
+    omitted = set()
+else:
+    selected_numbers = []
+    if normalized:
+        selected_numbers = [part.strip() for part in normalized.split(",")]
+        if any(not part or not part.isdigit() or part not in choices for part in selected_numbers):
+            raise SystemExit("--omit-large must be comma-separated numbers shown in the inventory, or none")
+        if len(selected_numbers) != len(set(selected_numbers)):
+            raise SystemExit("--omit-large numbers must not repeat")
+    omitted = {choices[number] for number in selected_numbers}
+    omitted.update(saved - verified_paths)
+
+with open(filtered_path, "w", encoding="utf-8") as selected_destination, open(
+    omitted_path, "w", encoding="utf-8"
+) as omitted_destination:
+    for fields in verified_rows:
+        destination = omitted_destination if fields[4] in omitted else selected_destination
+        print(*fields, sep="\t", file=destination)
+with open(omitted_json_path, "w", encoding="utf-8") as destination:
+    json.dump(sorted(omitted), destination, separators=(",", ":"))
+    destination.write("\n")
+PYEOF
+
+selected_file_count=$(wc -l < "$FILTERED" | tr -d ' ')
+selected_bytes=$(awk -F '\t' '{total += $2} END {printf "%.0f", total}' "$FILTERED")
+omitted_file_count=$(wc -l < "$OMITTED" | tr -d ' ')
+omitted_bytes=$(awk -F '\t' '{total += $2} END {printf "%.0f", total}' "$OMITTED")
+if [ "$omitted_file_count" -gt 0 ]; then
+  say "  ${Y}Materialization:${X} ${selected_file_count}/${verified_file_count} files selected · $(human "$omitted_bytes") intentionally omitted"
+else
+  say "  ${G}Materialization:${X} all ${selected_file_count} verified files selected"
+fi
+log_event "selection selected_files=${selected_file_count} selected_bytes=${selected_bytes} omitted_files=${omitted_file_count} omitted_bytes=${omitted_bytes}"
+
+if [ "$COMMAND" = "setup" ] && [ "$DRYRUN" -eq 0 ]; then
+  GENOME_SYNC_KEY_ID="$KEY_ID" GENOME_SYNC_APPLICATION_KEY="$APP_KEY" \
+    credential_store set "$DONOR" \
+    || { say "\n${R}  Could not store the credential securely.${X}"; exit 1; }
+  if ! config_write "$DONOR" "$DEST_ABS" "$ONLY" "$EXCLUDE" "$SAVED_OMITTED_JSON"; then
+    credential_store delete "$DONOR" >/dev/null 2>&1 || true
+    say "\n${R}  Could not save the genome-sync configuration.${X}"
+    exit 1
+  fi
+  say "  ${G}securely configured future syncs for ${DEST_ABS}${X}"
+fi
+unset KEY_ID APP_KEY B2_APPLICATION_KEY_ID B2_APPLICATION_KEY
 
 if [ -n "$(find "$DEST_ABS" -type f ! -path "$DEST_ABS/.genome-download-tmp.*/*" -print -quit 2>/dev/null)" ]; then
   say "  ${D}indexing existing verified content for differential sync${X}"
@@ -1987,7 +2182,7 @@ EOF
 done < "$FILTERED"
 progress_newline
 
-cut -f5 "$FILTERED" > "$RELS"
+cut -f5 "$VERIFIED" > "$RELS"
 _section_of() {
   case "$1" in
     ensemble/*) printf ensemble ;;
@@ -2040,8 +2235,15 @@ if [ "$DRYRUN" -eq 1 ]; then
   exit 0
 fi
 
-if { [ -s "$TODO" ] || [ "$prune_n" -gt 0 ]; } \
-  && ! confirm "  Apply this verified update?"; then
+confirmation_required=0
+if [ -s "$TODO" ] || [ "$prune_n" -gt 0 ]; then
+  confirmation_required=1
+elif { [ "$COMMAND" = "setup" ] || [ "$COMMAND" = "sync" ]; } \
+  && [ "$ASSUME_YES" -eq 0 ] && [ "$FILTER_EXPLICIT" -eq 0 ] \
+  && [ "$OMIT_LARGE_EXPLICIT" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
+  confirmation_required=1
+fi
+if [ "$confirmation_required" -eq 1 ] && ! confirm "  Apply this verified update?"; then
   say "\n  No files changed."
   log_event "finish status=cancelled"
   exit 0
@@ -2149,13 +2351,13 @@ fi
 if [ "$(tr -d '[:space:]' < "$ACTIVE_RESULTS")" != "{}" ]; then
   guide_root="$TEMP_ROOT/generated-guides"
   mkdir -p "$guide_root"
-  "${PY[@]}" - "$ACTIVE_RESULTS" "$FILTERED" "$guide_root" <<'PYEOF' \
+  "${PY[@]}" - "$ACTIVE_RESULTS" "$FILTERED" "$OMITTED" "$guide_root" <<'PYEOF' \
     || { say "${R}could not build the active bundle guides${X}"; exit 1; }
 import json
 import sys
 from pathlib import Path
 
-active_path, filtered_path, guide_root = sys.argv[1:]
+active_path, filtered_path, omitted_path, guide_root = sys.argv[1:]
 active = json.load(open(active_path, encoding="utf-8"))
 if not isinstance(active, dict) or not active:
     raise SystemExit("active results index must be a non-empty object")
@@ -2163,12 +2365,14 @@ root_lines = [
     "# Active genome bundles",
     "",
     "This index is generated from `.genome-manifest.json`. Its `active_results`",
-    "map is the local authority for the current results path of each assay.",
+    "map binds the verified remote activation for each assay. The manifest's",
+    "`materialization` and `omitted_files` fields say which activated bytes are local.",
     "",
     "| Assay | Sample | Updated | Results plan | Results index |",
     "|---|---|---|---|---|",
 ]
 lab_assays = set()
+omitted_by_assay = {}
 for line in open(filtered_path, encoding="utf-8"):
     fields = line.rstrip("\n").split("\t")
     if len(fields) != 5:
@@ -2176,6 +2380,13 @@ for line in open(filtered_path, encoding="utf-8"):
     relative = fields[4]
     if "/lab/" in relative:
         lab_assays.add(relative.split("/", 1)[0])
+for line in open(omitted_path, encoding="utf-8"):
+    fields = line.rstrip("\n").split("\t")
+    if len(fields) != 5:
+        raise SystemExit("omitted remote row is malformed")
+    assay = fields[4].split("/", 1)[0] if "/" in fields[4] else None
+    if assay in active:
+        omitted_by_assay[assay] = omitted_by_assay.get(assay, 0) + 1
 
 guide_root_path = Path(guide_root)
 for assay, record in sorted(active.items()):
@@ -2188,6 +2399,12 @@ for assay, record in sorted(active.items()):
     assay_root = guide_root_path / assay
     assay_root.mkdir(parents=True, exist_ok=False)
     has_lab = assay in lab_assays
+    omitted_count = omitted_by_assay.get(assay, 0)
+    materialization_line = (
+        f"- Local materialization is partial: {omitted_count} activated payload(s) are intentionally omitted."
+        if omitted_count
+        else "- Local materialization includes every selected activated payload."
+    )
     lab_line = (
         "- [Lab and sequencing files](lab/) — read `lab_manifest.json` and "
         "`_COMPLETE.json` before using them."
@@ -2200,6 +2417,7 @@ for assay, record in sorted(active.items()):
         f"This directory keeps the lab inputs and current interpreted results for sample `{record['sample_id']}` together.",
         "",
         f"- [Current results](results/) — plan `{record['plan_sha256']}`, activated {record['authorized_at']}",
+        materialization_line,
         lab_line,
         "- [Assay contents](TOC.md)",
         "",
@@ -2211,6 +2429,7 @@ for assay, record in sorted(active.items()):
         f"Sample: `{record['sample_id']}`  ",
         f"Active results plan: `{record['plan_sha256']}`  ",
         f"Activated: {record['authorized_at']}",
+        f"Local materialization: {'partial' if omitted_count else 'complete'}",
         "",
         "## Results",
         "",
@@ -2231,6 +2450,7 @@ for assay, record in sorted(active.items()):
         f"This directory is the assay container for sample `{record['sample_id']}`. Work read-only unless the donor explicitly asks for a local change.",
         "",
         "Read `../.genome-manifest.json` first. Its `active_results` entry identifies the exact plan and local results path. Then read `results/AGENTS.md` for the evidence and interpretation contract and `results/TOC.md` to locate stages.",
+        "The remote activation and the local materialization are separate facts. Check `materialization.complete` and `omitted_files` before claiming a payload is local.",
         "",
         "Treat `lab/` as sequencing evidence, not interpretation. Validate `lab/lab_manifest.json` and `lab/_COMPLETE.json` before relying on it. Never upload donor-specific sequence, variants, genotypes, or findings to a network service without explicit informed permission.",
         "",
@@ -2265,7 +2485,7 @@ fi
 
 fs_guard validate-tree || exit 1
 manifest_temporary="$TEMP_ROOT/manifest.json"
-"${PY[@]}" - "$manifest_temporary" "$DONOR" "$BUCKET" "$FILTERED" "$HASHES" "$DEST_ABS/$MANIFEST" "$ONLY" "$EXCLUDE" "$ACTIVE_RESULTS" "$DEST_ABS" <<'PYEOF' \
+"${PY[@]}" - "$manifest_temporary" "$DONOR" "$BUCKET" "$VERIFIED" "$FILTERED" "$OMITTED" "$HASHES" "$DEST_ABS/$MANIFEST" "$ONLY" "$EXCLUDE" "$ACTIVE_RESULTS" "$DEST_ABS" <<'PYEOF' \
   || { say "${R}could not build a complete local manifest${X}"; exit 1; }
 import datetime
 import json
@@ -2276,7 +2496,9 @@ from pathlib import Path
     manifest_path,
     donor,
     bucket,
+    verified_path,
     filtered_path,
+    omitted_path,
     hashes_path,
     existing_manifest_path,
     only,
@@ -2295,12 +2517,31 @@ def section_of(relative):
 requested_sections = {only} if only else {"lab", "results", "ensemble"}
 if exclude:
     requested_sections.discard(exclude)
+verified = {}
+for line in open(verified_path, encoding="utf-8"):
+    remote_sha1, size, expected_sha256, _key, relative = line.rstrip("\n").split("\t")
+    if relative in verified:
+        raise SystemExit(f"duplicate verified remote path: {relative}")
+    verified[relative] = (int(size), remote_sha1, expected_sha256)
 remote = {}
 for line in open(filtered_path, encoding="utf-8"):
-    remote_sha1, size, _expected_sha256, _key, relative = line.rstrip("\n").split("\t")
+    remote_sha1, size, expected_sha256, _key, relative = line.rstrip("\n").split("\t")
     if relative in remote:
         raise SystemExit(f"duplicate projected local path: {relative}")
-    remote[relative] = (int(size), remote_sha1)
+    remote[relative] = (int(size), remote_sha1, expected_sha256)
+omitted = {}
+for line in open(omitted_path, encoding="utf-8"):
+    remote_sha1, size, expected_sha256, _key, relative = line.rstrip("\n").split("\t")
+    if relative in omitted:
+        raise SystemExit(f"duplicate omitted remote path: {relative}")
+    omitted[relative] = {
+        "size": int(size),
+        "remote_sha1": None if remote_sha1 == "unverified" else remote_sha1,
+        "sha256": None if expected_sha256 == "unbound" else expected_sha256,
+        "reason": "user_deselected_large_payload",
+    }
+if set(remote) & set(omitted) or set(verified) != set(remote) | set(omitted):
+    raise SystemExit("selected and omitted rows do not partition the verified remote inventory")
 observed = {}
 for line in open(hashes_path, encoding="utf-8"):
     relative, size, remote_sha1, sha256, proof = line.rstrip("\n").split("\t")
@@ -2314,7 +2555,7 @@ for line in open(hashes_path, encoding="utf-8"):
     }
 if set(remote) != set(observed):
     raise SystemExit(f"manifest hash coverage differs from remote plan: missing={sorted(set(remote)-set(observed))[:5]}")
-for relative, (size, remote_sha1) in remote.items():
+for relative, (size, remote_sha1, _expected_sha256) in remote.items():
     record = observed[relative]
     if record["size"] != size or record["remote_sha1"] != (None if remote_sha1 == "unverified" else remote_sha1):
         raise SystemExit(f"manifest identity mismatch: {relative}")
@@ -2334,6 +2575,18 @@ merged_files = {
 }
 merged_files.update(observed)
 
+existing_omitted = existing.get("omitted_files", {})
+if not isinstance(existing_omitted, dict) or any(
+    not isinstance(item, dict) for item in existing_omitted.values()
+):
+    raise SystemExit("existing omitted_files must be an object of records")
+merged_omitted = {
+    relative: record
+    for relative, record in existing_omitted.items()
+    if section_of(relative) not in requested_sections
+}
+merged_omitted.update(omitted)
+
 if "results" in requested_sections:
     active_results = json.load(open(active_results_path, encoding="utf-8"))
     if not isinstance(active_results, dict) or not active_results:
@@ -2342,6 +2595,18 @@ else:
     active_results = existing.get("active_results", {})
 if not isinstance(active_results, dict):
     raise SystemExit("active_results must be an object")
+active_results = {assay: dict(record) for assay, record in active_results.items()}
+if "results" in requested_sections:
+    for assay, record in active_results.items():
+        assay_omitted = {
+            relative: omitted_record
+            for relative, omitted_record in omitted.items()
+            if relative.startswith(f"{assay}/results/")
+        }
+        record["remote_activation_validated"] = True
+        record["local_materialization_complete"] = not assay_omitted
+        record["omitted_file_count"] = len(assay_omitted)
+        record["omitted_bytes"] = sum(item["size"] for item in assay_omitted.values())
 
 synced_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 section_sync = existing.get("section_sync", {})
@@ -2352,7 +2617,7 @@ for section in requested_sections:
     section_sync[section] = synced_at
 payload = {
     "tool": "download-genome.sh",
-    "schema": 3,
+    "schema": 4,
     "donor": donor,
     "bucket": bucket,
     "location": location,
@@ -2368,6 +2633,17 @@ payload = {
         ],
     ],
     "file_count": len(merged_files),
+    "materialization": {
+        "complete": not merged_omitted,
+        "verified_remote_file_count": len(merged_files) + len(merged_omitted),
+        "verified_remote_bytes": sum(record["size"] for record in merged_files.values())
+        + sum(record["size"] for record in merged_omitted.values()),
+        "materialized_file_count": len(merged_files),
+        "materialized_bytes": sum(record["size"] for record in merged_files.values()),
+        "omitted_file_count": len(merged_omitted),
+        "omitted_bytes": sum(record["size"] for record in merged_omitted.values()),
+    },
+    "omitted_files": dict(sorted(merged_omitted.items())),
     "files": dict(sorted(merged_files.items())),
 }
 with open(manifest_path, "w", encoding="utf-8") as destination:
@@ -2376,6 +2652,20 @@ with open(manifest_path, "w", encoding="utf-8") as destination:
 PYEOF
 chmod 600 "$manifest_temporary"
 fs_guard install "$MANIFEST" "$manifest_temporary" || exit 1
+
+if [ "$COMMAND" = "setup" ] || [ "$COMMAND" = "sync" ]; then
+  selected_omitted_json="$(tr -d '\n' < "$OMITTED_JSON_FILE")"
+  preference_only="$ONLY"
+  preference_exclude="$EXCLUDE"
+  if [ "$COMMAND" = "sync" ]; then
+    preference_only="$configured_only"
+    preference_exclude="$configured_exclude"
+  fi
+  if ! config_write "$DONOR" "$DEST_ABS" "$preference_only" "$preference_exclude" "$selected_omitted_json"; then
+    say "${Y}  Data synchronized, but the saved large-payload choice could not be updated.${X}"
+    exit 1
+  fi
+fi
 
 log_event "finish status=success manifest=${DEST_ABS}/${MANIFEST}"
 persist_log || { say "${Y}  Sync succeeded, but the local log could not be saved.${X}"; }
