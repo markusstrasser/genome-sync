@@ -2369,19 +2369,28 @@ EOF
   progress_newline
 fi
 
-if [ "$(tr -d '[:space:]' < "$ACTIVE_RESULTS")" != "{}" ]; then
-  guide_root="$TEMP_ROOT/generated-guides"
+render_bundle_guides() {
+  local finalized_manifest="$1"
+  local guide_root="$TEMP_ROOT/generated-guides"
   mkdir -p "$guide_root"
-  "${PY[@]}" - "$ACTIVE_RESULTS" "$FILTERED" "$OMITTED" "$guide_root" <<'PYEOF' \
+  "${PY[@]}" - "$finalized_manifest" "$guide_root" <<'PYEOF' \
     || { say "${R}could not build the active bundle guides${X}"; exit 1; }
 import json
 import sys
 from pathlib import Path
 
-active_path, filtered_path, omitted_path, guide_root = sys.argv[1:]
-active = json.load(open(active_path, encoding="utf-8"))
-if not isinstance(active, dict) or not active:
-    raise SystemExit("active results index must be a non-empty object")
+manifest_path, guide_root = sys.argv[1:]
+manifest = json.load(open(manifest_path, encoding="utf-8"))
+if not isinstance(manifest, dict) or manifest.get("schema") != 4:
+    raise SystemExit("finalized local manifest must use schema 4")
+active = manifest.get("active_results")
+files = manifest.get("files")
+omitted = manifest.get("omitted_files")
+unavailable = manifest.get("unavailable_files")
+if not all(isinstance(value, dict) for value in (active, files, omitted, unavailable)):
+    raise SystemExit("finalized local manifest materialization maps are malformed")
+if not active:
+    raise SystemExit(0)
 root_lines = [
     "# Active genome bundles",
     "",
@@ -2389,43 +2398,56 @@ root_lines = [
     "map binds the verified remote activation for each assay. The manifest's",
     "`materialization`, `omitted_files`, and `unavailable_files` fields say which activated bytes are local.",
     "",
-    "| Assay | Sample | Updated | Results plan | Results index |",
-    "|---|---|---|---|---|",
+    "| Assay | Sample | Updated | Local | Results plan | Results index |",
+    "|---|---|---|---|---|---|",
 ]
-lab_assays = set()
-omitted_by_assay = {}
-for line in open(filtered_path, encoding="utf-8"):
-    fields = line.rstrip("\n").split("\t")
-    if len(fields) != 5:
-        raise SystemExit("projected remote row is malformed")
-    relative = fields[4]
-    if "/lab/" in relative:
-        lab_assays.add(relative.split("/", 1)[0])
-for line in open(omitted_path, encoding="utf-8"):
-    fields = line.rstrip("\n").split("\t")
-    if len(fields) != 5:
-        raise SystemExit("omitted remote row is malformed")
-    assay = fields[4].split("/", 1)[0] if "/" in fields[4] else None
-    if assay in active:
-        omitted_by_assay[assay] = omitted_by_assay.get(assay, 0) + 1
+known_paths = set(files) | set(omitted) | set(unavailable)
+lab_assays = {
+    relative.split("/", 1)[0]
+    for relative in known_paths
+    if "/lab/" in relative
+}
 
 guide_root_path = Path(guide_root)
 for assay, record in sorted(active.items()):
+    if not isinstance(record, dict):
+        raise SystemExit(f"active result record is malformed for assay {assay}")
     local_path = record["local_path"]
+    local_complete = record.get("local_materialization_complete")
+    omitted_count = record.get("omitted_file_count")
+    unavailable_count = record.get("unavailable_file_count")
+    if (
+        type(local_complete) is not bool
+        or isinstance(omitted_count, bool)
+        or not isinstance(omitted_count, int)
+        or omitted_count < 0
+        or isinstance(unavailable_count, bool)
+        or not isinstance(unavailable_count, int)
+        or unavailable_count < 0
+    ):
+        raise SystemExit(f"active result materialization is malformed for assay {assay}")
+    local_label = "complete" if local_complete else "partial"
     root_lines.append(
         f"| {assay} | {record['sample_id']} | {record['authorized_at']} | "
-        f"`{record['plan_sha256']}` | "
+        f"{local_label} | `{record['plan_sha256']}` | "
         f"[open {local_path}]({local_path}/TOC.md) |"
     )
     assay_root = guide_root_path / assay
     assay_root.mkdir(parents=True, exist_ok=False)
     has_lab = assay in lab_assays
-    omitted_count = omitted_by_assay.get(assay, 0)
-    materialization_line = (
-        f"- Local materialization is partial: {omitted_count} activated payload(s) are intentionally omitted."
-        if omitted_count
-        else "- Local materialization includes every selected activated payload."
-    )
+    if local_complete:
+        materialization_line = "- Local materialization includes every activated payload."
+    else:
+        partial_reasons = []
+        if omitted_count:
+            partial_reasons.append(f"{omitted_count} intentionally omitted")
+        if unavailable_count:
+            partial_reasons.append(f"{unavailable_count} missing or corrupt")
+        if not partial_reasons:
+            partial_reasons.append("remote activation is not locally validated")
+        materialization_line = (
+            "- Local materialization is partial: " + "; ".join(partial_reasons) + "."
+        )
     lab_line = (
         "- [Lab and sequencing files](lab/) — read `lab_manifest.json` and "
         "`_COMPLETE.json` before using them."
@@ -2450,7 +2472,7 @@ for assay, record in sorted(active.items()):
         f"Sample: `{record['sample_id']}`  ",
         f"Active results plan: `{record['plan_sha256']}`  ",
         f"Activated: {record['authorized_at']}",
-        f"Local materialization: {'partial' if omitted_count else 'complete'}",
+        f"Local materialization: {local_label}",
         "",
         "## Results",
         "",
@@ -2485,13 +2507,14 @@ for assay, record in sorted(active.items()):
 
 (guide_root_path / "TOC.md").write_text("\n".join(root_lines) + "\n", encoding="utf-8")
 PYEOF
+  [ -f "$guide_root/TOC.md" ] || return 0
   chmod -R go-rwx "$guide_root"
   fs_guard install "TOC.md" "$guide_root/TOC.md" || exit 1
   while IFS= read -r guide_path; do
     relative_guide="${guide_path#"$guide_root/"}"
     fs_guard install "$relative_guide" "$guide_path" || exit 1
   done < <(find "$guide_root" -mindepth 2 -maxdepth 2 -type f -name '*.md' | sort)
-fi
+}
 
 if [ "$prune_n" -gt 0 ]; then
   say "\n  ${R}Removing ${prune_n} file(s) absent remotely:${X}"
@@ -2847,6 +2870,8 @@ with open(manifest_path, "w", encoding="utf-8") as destination:
     destination.write("\n")
 PYEOF
 chmod 600 "$manifest_temporary"
+render_bundle_guides "$manifest_temporary"
+fs_guard validate-tree || exit 1
 fs_guard install "$MANIFEST" "$manifest_temporary" || exit 1
 
 if [ "$COMMAND" = "setup" ] || [ "$COMMAND" = "sync" ]; then

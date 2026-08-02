@@ -74,6 +74,16 @@ def _seed_legacy_result_records(client: FakeGenomeSync) -> dict[str, bytes]:
             "local_path": "shortread/results",
         }
     }
+    assay_root = client.destination / "shortread"
+    (assay_root / "README.md").write_text(
+        "# Assay: shortread\n\n- Local materialization includes every activated payload.\n"
+    )
+    (assay_root / "TOC.md").write_text(
+        "# shortread contents\n\nLocal materialization: complete\n"
+    )
+    (client.destination / "TOC.md").write_text(
+        "# Active genome bundles\n\n| shortread | complete |\n"
+    )
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     os.chmod(manifest_path, 0o600)
     return contents
@@ -178,6 +188,12 @@ def test_omitted_payload_can_be_added_later(fake_genome_sync: FakeGenomeSync) ->
     ) + len(partial["omitted_files"])
     assert "shortread/lab/lab_manifest.json" in partial["files"]
     assert "shortread/lab/_COMPLETE.json" in partial["files"]
+    outside_current_inventory = "longread/results/huge.cram"
+    config = json.loads(client.config_file.read_text())
+    config["omitted_large_paths"].append(outside_current_inventory)
+    config["omitted_large_paths"].sort()
+    client.config_file.write_text(json.dumps(config, sort_keys=True) + "\n")
+    os.chmod(client.config_file, 0o600)
 
     completed = _run(client, "sync", "--omit-large", "none", "--yes")
     assert completed.returncode == 0, completed.stderr + completed.stdout
@@ -186,7 +202,7 @@ def test_omitted_payload_can_be_added_later(fake_genome_sync: FakeGenomeSync) ->
     assert complete["materialization"]["complete"] is True
     assert complete["omitted_files"] == {}
     config = json.loads(client.config_file.read_text())
-    assert config["omitted_large_paths"] == []
+    assert config["omitted_large_paths"] == [outside_current_inventory]
 
 
 def test_deselecting_downloaded_payload_never_deletes_it(
@@ -205,27 +221,6 @@ def test_deselecting_downloaded_payload_never_deletes_it(
     assert partial["materialization"]["complete"] is False
     assert "shortread/lab/payload-1.bin" in partial["omitted_files"]
     assert "shortread/lab/payload-1.bin" not in partial["files"]
-
-
-def test_include_all_preserves_saved_omissions_outside_current_inventory(
-    fake_genome_sync: FakeGenomeSync,
-) -> None:
-    client = fake_genome_sync
-    _setup(client, "1")
-    config = json.loads(client.config_file.read_text())
-    outside_current_inventory = "longread/results/huge.cram"
-    config["omitted_large_paths"].append(outside_current_inventory)
-    config["omitted_large_paths"].sort()
-    client.config_file.write_text(json.dumps(config, sort_keys=True) + "\n")
-    os.chmod(client.config_file, 0o600)
-
-    completed = _run(client, "sync", "--omit-large", "none", "--yes")
-    assert completed.returncode == 0, completed.stderr + completed.stdout
-    updated = json.loads(client.config_file.read_text())
-    assert updated["omitted_large_paths"] == [outside_current_inventory]
-    assert (
-        client.destination / "shortread" / "lab" / "payload-1.bin"
-    ).read_bytes() == client.payloads["shortread/lab/payload-1.bin"]
 
 
 def test_repeated_setup_prefills_and_commits_only_after_confirmation(
@@ -327,3 +322,9 @@ def test_lab_only_sync_audits_carried_results_and_normalizes_active_record(
     assert active["unavailable_bytes"] == (
         len(contents[corrupt_relative]) + len(contents[missing_relative])
     )
+    assay_readme = (client.destination / "shortread" / "README.md").read_text()
+    assay_toc = (client.destination / "shortread" / "TOC.md").read_text()
+    root_toc = (client.destination / "TOC.md").read_text()
+    assert "Local materialization is partial: 2 missing or corrupt." in assay_readme
+    assert "Local materialization: partial" in assay_toc
+    assert "| shortread | sample-001 | 2026-07-31T00:00:00Z | partial |" in root_toc
