@@ -1605,10 +1605,10 @@ def resolve_results_activation(*, assay, group):
                         field=f"{stage} current pointer",
                     )
             if state == "selected":
-                if currency["completion_eligible"] is not True:
-                    raise SystemExit(
-                        f"selected result lacks completion-eligible currency: {prefix}{stage}"
-                    )
+                # Selected means "in this shipped snapshot" (last SUCCESS receipt +
+                # bytes). Stage-currency completion_eligible is a pipeline rerun
+                # screen, not a donor download veto — RECOMPUTE_* last-SUCCESS
+                # packages are intentionally downloadable (operator 2026-08-05).
                 selected_from_dispositions.append(stage)
             if state == "excluded-noncurrent" and currency["completion_eligible"] is not False:
                 raise SystemExit(
