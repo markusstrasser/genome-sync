@@ -1318,7 +1318,15 @@ def resolve_results_activation(*, assay, group):
     if marker_schema != "donor-results-completion/v3":
         raise SystemExit(f"results activation marker has the wrong contract: {prefix}")
     required_marker_fields = common_marker_fields | {"published_at"}
-    if set(marker_payload) != required_marker_fields:
+    # `omissions` discloses which registered stages were not shipped and why. It is
+    # declared optional rather than required so a marker that gains a disclosure
+    # field is not rejected outright by a client that predates it — exact set
+    # equality made the published contract un-evolvable.
+    optional_marker_fields = {"omissions"}
+    marker_fields = set(marker_payload)
+    if not required_marker_fields <= marker_fields or not (
+        marker_fields - required_marker_fields <= optional_marker_fields
+    ):
         raise SystemExit(f"results activation marker has an unexpected schema: {prefix}")
     plan_sha256 = require_sha256(
         marker_payload["plan_sha256"], field="results marker plan_sha256"
