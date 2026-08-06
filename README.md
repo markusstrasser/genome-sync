@@ -13,18 +13,40 @@ updated.
 
 ## Install
 
+**Nothing to install.** `uvx` fetches and runs the published client in one command:
+
 ```bash
-uv tool install --force git+https://github.com/markusstrasser/genome-sync
-genome-sync --help
+B2_APPLICATION_KEY_ID=... B2_APPLICATION_KEY=... \
+  uvx --from git+https://github.com/markusstrasser/genome-sync@released \
+  genome-sync --dest ~/Genome/donor-id donor-id --dry-run
 ```
 
-Donors never upgrade by hand. The entry point re-resolves this repository on every
-invocation, so the newest commit on `main` runs on the next sync. The refresh is
-best-effort — no `uv`, no network, a GitHub outage, or a timeout costs a newer
-client, never the ability to synchronize data that lives in B2. Set
-`GENOME_SYNC_NO_SELF_UPDATE=1` to disable it.
+Drop `--dry-run` to write. That is the whole client — no install step, no
+`setup`, no stored credential; the key is supplied per invocation and the
+destination is explicit. This is the fastest way to get a donor their data and
+the fastest way to test a change.
 
-Because `main` is what every donor resolves, treat a push there as a release.
+`@released` is the pin donors resolve. A push to `main` ships nothing; promoting
+`main` to `released` is the release.
+
+### Installing instead (optional, for offline resilience)
+
+```bash
+uv tool install --force git+https://github.com/markusstrasser/genome-sync@released
+genome-sync setup donor-id      # stores the key in the OS credential service
+```
+
+The only thing installing buys is working **offline**: `uvx --from git+https://…`
+resolves the repository on every run and hard-fails without network even with a
+warm cache, whereas an installed client runs with no resolution at all. Online —
+the normal case — the two are equivalent, and `uvx` was verified against a real
+donor snapshot on 2026-08-06 producing byte-identical output to the installed
+client.
+
+An installed client still re-resolves this repository on each invocation, so
+donors never upgrade by hand; that refresh is best-effort and its failure costs a
+newer client, never the ability to sync. `GENOME_SYNC_NO_SELF_UPDATE=1` disables
+it.
 
 ## Configure and synchronize
 
