@@ -7,6 +7,7 @@ set -uo pipefail
 BUCKET="computational-genomics"
 MANIFEST=".genome-manifest.json"
 B2_VERSION="4.7.1"
+MAX_STREAMS_PER_FILE=8
 KEYRING_VERSION="25.7.0"
 KEYRING_SERVICE="org.synthoria.genome-sync.b2"
 B2_RUN=(uvx --from "b2==${B2_VERSION}" b2)
@@ -38,6 +39,9 @@ OPTIONS:
                        (comma-separated, or "none" to include every payload)
       --prune          delete previously managed files that are absent from the
                        new active snapshot (default: keep them)
+      --jobs N         download up to N objects concurrently (default: 4,
+                       range 1..16); verification and installation stay serial.
+                       --jobs 1 is the fully serial path.
   -y, --yes            do not ask for confirmation
   -n, --dry-run        show what would change, then stop
   -h, --help           show this help
@@ -84,7 +88,7 @@ case "${1:-}" in
 esac
 DEST=""; DEST_EXPLICIT=0; ONLY=""; EXCLUDE=""; FILTER_EXPLICIT=0
 OMIT_LARGE_SPEC=""; OMIT_LARGE_EXPLICIT=0; SAVED_OMITTED_JSON="[]"
-PRUNE=0; DRYRUN=0; ASSUME_YES=0; POS=()
+PRUNE=0; DRYRUN=0; ASSUME_YES=0; JOBS=4; JOBS_EXPLICIT=0; POS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -98,6 +102,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --prune) PRUNE=1; shift ;;
+    --jobs) JOBS="${2:?--jobs needs a number 1..16}"; JOBS_EXPLICIT=1; shift 2 ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     -n|--dry-run) DRYRUN=1; shift ;;
     --) shift; while [ $# -gt 0 ]; do POS+=("$1"); shift; done ;;
@@ -126,6 +131,14 @@ for section in "$ONLY" "$EXCLUDE"; do
 done
 if [ -n "$ONLY" ] && [ -n "$EXCLUDE" ]; then
   echo "error: use either --only or --exclude, not both" >&2
+  exit 1
+fi
+
+case "$JOBS" in
+  ''|*[!0-9]*) echo "error: --jobs must be an integer between 1 and 16 (got '$JOBS')" >&2; exit 1 ;;
+esac
+if [ "$JOBS" -lt 1 ] || [ "$JOBS" -gt 16 ]; then
+  echo "error: --jobs must be between 1 and 16 (got '$JOBS')" >&2
   exit 1
 fi
 
@@ -423,7 +436,8 @@ case "$COMMAND" in
     ;;
   status)
     if [ -n "$DONOR" ] || [ "$DEST_EXPLICIT" -eq 1 ] || [ -n "$ONLY" ] || [ -n "$EXCLUDE" ] \
-      || [ "$OMIT_LARGE_EXPLICIT" -eq 1 ] || [ "$PRUNE" -eq 1 ] || [ "$DRYRUN" -eq 1 ]; then
+      || [ "$OMIT_LARGE_EXPLICIT" -eq 1 ] || [ "$PRUNE" -eq 1 ] || [ "$DRYRUN" -eq 1 ] \
+      || [ "$JOBS_EXPLICIT" -eq 1 ]; then
       echo "error: status accepts no donor or sync options" >&2
       exit 1
     fi
@@ -458,7 +472,8 @@ case "$COMMAND" in
   destination)
     if [ -z "$DONOR" ] || [ "$DEST_EXPLICIT" -eq 1 ] || [ -n "$ONLY" ] \
       || [ -n "$EXCLUDE" ] || [ "$OMIT_LARGE_EXPLICIT" -eq 1 ] \
-      || [ "$PRUNE" -eq 1 ] || [ "$DRYRUN" -eq 1 ] || [ "$ASSUME_YES" -eq 1 ]; then
+      || [ "$PRUNE" -eq 1 ] || [ "$DRYRUN" -eq 1 ] || [ "$ASSUME_YES" -eq 1 ] \
+      || [ "$JOBS_EXPLICIT" -eq 1 ]; then
       echo "error: usage: genome-sync destination <directory>" >&2
       exit 1
     fi
@@ -963,6 +978,10 @@ printf '{}\n' > "$ACTIVE_RESULTS"
 printf '%s\n' "$SAVED_OMITTED_JSON" > "$OMITTED_JSON_FILE"
 LOG_PERSISTED=0
 download_process_id=""
+PREFETCH_DIR=""
+PREFETCH_PIDS=""
+PREFETCH_PRODUCER_PID=""
+PREFETCH_SLOTS_FIFO=""
 log_event() {
   printf '%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >> "$SESSION_LOG"
 }
@@ -1004,8 +1023,20 @@ finally:
     os.close(descriptor)
 PYEOF
 }
+stop_prefetch() {
+  # Best-effort teardown of the background producer and any in-flight download
+  # workers. Workers only ever write inside TEMP_ROOT, so a late worker cannot
+  # corrupt the destination; this only avoids leaving orphaned b2 processes.
+  [ -n "$PREFETCH_PRODUCER_PID" ] && kill -TERM "$PREFETCH_PRODUCER_PID" 2>/dev/null
+  if [ -n "$PREFETCH_PIDS" ] && [ -f "$PREFETCH_PIDS" ]; then
+    while IFS= read -r prefetch_worker_pid; do
+      [ -n "$prefetch_worker_pid" ] && kill -TERM "$prefetch_worker_pid" 2>/dev/null
+    done < "$PREFETCH_PIDS"
+  fi
+}
 cleanup() {
   local exit_code=$?
+  stop_prefetch
   if [ "$exit_code" -ne 0 ]; then
     log_event "finish status=failed exit_code=${exit_code}"
   fi
@@ -1016,6 +1047,7 @@ cleanup() {
 terminate() {
   local exit_code="$1"
   trap - HUP INT TERM
+  stop_prefetch
   if [ -n "$download_process_id" ] && kill -0 "$download_process_id" 2>/dev/null; then
     kill -TERM "$download_process_id" 2>/dev/null || true
     wait "$download_process_id" 2>/dev/null || true
@@ -2313,10 +2345,101 @@ if [ "${FREE_KB:-0}" -lt "${NEED_KB:-0}" ]; then
   exit 1
 fi
 
+# One download worker: capture a single object into its own private temp under
+# $TEMP_ROOT and publish an atomic status file in $PREFETCH_DIR. Runs inside a
+# worker subshell. A worker NEVER calls fs_guard install, never writes $HASHES,
+# and never touches the destination tree — it writes only inside $TEMP_ROOT (the
+# object bytes) and $PREFETCH_DIR under CONTROL_DIR (status/log bookkeeping).
+prefetch_fetch_one() {
+  local prefetch_index="$1" prefetch_key="$2"
+  local prefetch_temp prefetch_log prefetch_status_partial prefetch_status_final
+  prefetch_status_final="${PREFETCH_DIR}/${prefetch_index}.status"
+  prefetch_status_partial="${PREFETCH_DIR}/${prefetch_index}.status.partial"
+  prefetch_log="${PREFETCH_DIR}/${prefetch_index}.log"
+  # Object bytes must land under TEMP_ROOT (same filesystem as the destination)
+  # so the serial consumer's fs_guard hash/install path is unchanged; only the
+  # FIFO, status, log, and pid bookkeeping live in CONTROL_DIR (off the dest
+  # tree, so validate-tree never sees the non-regular FIFO).
+  if ! prefetch_temp="$(mktemp "${TEMP_ROOT}/object.XXXXXX")"; then
+    printf 'FAIL\t\n' > "$prefetch_status_partial"
+    mv -f "$prefetch_status_partial" "$prefetch_status_final"
+    return
+  fi
+  chmod 600 "$prefetch_temp"
+  if "${B2_RUN[@]}" file download --no-progress \
+      --max-download-streams-per-file "$MAX_STREAMS_PER_FILE" \
+      "b2://${BUCKET}/${prefetch_key}" "$prefetch_temp" > "$prefetch_log" 2>&1; then
+    printf 'OK\t%s\n' "$prefetch_temp" > "$prefetch_status_partial"
+  else
+    printf 'FAIL\t%s\n' "$prefetch_temp" > "$prefetch_status_partial"
+  fi
+  # The rename is the ready signal: the consumer only ever sees a complete status.
+  mv -f "$prefetch_status_partial" "$prefetch_status_final"
+}
+
+# Launch the bounded-concurrency producer. It walks $TODO in the same order the
+# consumer does and, for every download item (state != reused-local), acquires
+# one of $JOBS slots from the token FIFO (fd 9) before spawning a worker. The
+# consumer returns a token only AFTER it installs the item, so at most $JOBS
+# objects are ever outstanding on disk — prefetch depth is coupled to
+# consumption and cannot materialize the whole snapshot in $TEMP_ROOT.
+start_prefetch() {
+  PREFETCH_DIR="${CONTROL_DIR}/prefetch"
+  mkdir -p "$PREFETCH_DIR"
+  chmod 700 "$PREFETCH_DIR"
+  PREFETCH_PIDS="${PREFETCH_DIR}/worker.pids"
+  : > "$PREFETCH_PIDS"
+  PREFETCH_SLOTS_FIFO="${PREFETCH_DIR}/prefetch.slots"
+  mkfifo "$PREFETCH_SLOTS_FIFO"
+  exec 9<>"$PREFETCH_SLOTS_FIFO"
+  local slot_token=0
+  while [ "$slot_token" -lt "$JOBS" ]; do
+    printf '\n' >&9
+    slot_token=$((slot_token + 1))
+  done
+  (
+    trap - EXIT HUP INT TERM
+    producer_index=0
+    while IFS=$'\t' read -r state remote_sha1 size expected_sha256 key relative reuse_source; do
+      producer_index=$((producer_index + 1))
+      if [ "$state" = "reused-local" ] && [ -n "$reuse_source" ]; then
+        continue
+      fi
+      IFS= read -r producer_slot <&9 || break
+      (
+        trap - EXIT HUP INT TERM
+        prefetch_fetch_one "$producer_index" "$key"
+      ) &
+      printf '%s\n' "$!" >> "$PREFETCH_PIDS"
+    done < "$TODO"
+    wait
+  ) &
+  PREFETCH_PRODUCER_PID=$!
+}
+
+# Consumer-side wait for one prefetched item; sets PREFETCH_RESULT/PREFETCH_TEMP.
+# Fail-closed if the producer exits without ever publishing a status.
+wait_for_prefetch() {
+  local prefetch_index="$1"
+  local prefetch_status="${PREFETCH_DIR}/${prefetch_index}.status"
+  while [ ! -f "$prefetch_status" ]; do
+    if [ -n "$PREFETCH_PRODUCER_PID" ] && ! kill -0 "$PREFETCH_PRODUCER_PID" 2>/dev/null; then
+      [ -f "$prefetch_status" ] && break
+      PREFETCH_RESULT="FAIL"; PREFETCH_TEMP=""
+      return 0
+    fi
+    render_progress "$completed_work" "$total_work" "$item_index" "$item_count" "$(progress_subject "$relative")"
+    sleep 0.2
+  done
+  IFS=$'\t' read -r PREFETCH_RESULT PREFETCH_TEMP < "$prefetch_status"
+}
+
 if [ -s "$TODO" ]; then
   hr; say "  ${B}${BL}Synchronizing…${X}"
   item_index=0; item_count=$(wc -l < "$TODO" | tr -d ' ')
   completed_work=0; total_work=$((total_xfer + local_reuse_bytes))
+  PREFETCH_RESULT=""; PREFETCH_TEMP=""
+  [ "$JOBS" -gt 1 ] && start_prefetch
   while IFS=$'\t' read -r state remote_sha1 size expected_sha256 key relative reuse_source; do
     item_index=$((item_index + 1))
     if [ ! -t 1 ]; then
@@ -2324,57 +2447,85 @@ if [ -s "$TODO" ]; then
     fi
     log_event "file start index=${item_index}/${item_count} state=${state} bytes=${size} path=${relative}"
     fs_guard prepare "$relative" || exit 1
-    temporary="$(mktemp "${TEMP_ROOT}/object.XXXXXX")" || exit 1
-    chmod 600 "$temporary"
-    temp_relative="${temporary#"${DEST_ABS}"/}"
-    observed=""
-    if [ "$state" = "reused-local" ] && [ -n "$reuse_source" ]; then
-      if observed="$(fs_guard copy "$reuse_source" "$temporary")"; then
-        IFS=$'\t' read -r observed_size observed_sha1 observed_sha256 <<EOF
-$observed
-EOF
-        if [ "$observed_size" != "$size" ] \
-          || { [ "$remote_sha1" != "unverified" ] && [ "$observed_sha1" != "$remote_sha1" ]; } \
-          || { [ "$expected_sha256" != "unbound" ] && [ "$observed_sha256" != "$expected_sha256" ]; }; then
-          progress_newline
-          say "  ${Y}Local reuse candidate changed; downloading ${relative}.${X}"
-          observed=""
-        else
-          [ ! -t 1 ] && say "    ${D}reused verified local content from ${reuse_source}${X}"
-        fi
+    # A prefetched item mirrors the producer's skip rule exactly, so token
+    # acquire (producer) and release (consumer) stay balanced.
+    item_prefetched=0
+    if [ "$JOBS" -gt 1 ]; then
+      if [ "$state" = "reused-local" ] && [ -n "$reuse_source" ]; then
+        item_prefetched=0
       else
-        progress_newline
-        say "  ${Y}Local reuse candidate became unavailable; downloading ${relative}.${X}"
-        observed=""
+        item_prefetched=1
       fi
     fi
-    if [ -z "$observed" ]; then
-      download_return_code=0
-      download_log="${TEMP_ROOT}/b2-download.log"
-      if [ -t 1 ]; then
-        "${B2_RUN[@]}" file download --no-progress "b2://${BUCKET}/${key}" "$temporary" \
-          > "$download_log" 2>&1 &
-        download_process_id=$!
-        while kill -0 "$download_process_id" 2>/dev/null; do
-          partial_bytes=$(wc -c < "$temporary" | tr -d ' ')
-          render_progress "$((completed_work + partial_bytes))" "$total_work" \
-            "$item_index" "$item_count" "$(progress_subject "$relative")"
-          sleep 1
-        done
-        wait "$download_process_id" || download_return_code=$?
-        download_process_id=""
-      else
-        "${B2_RUN[@]}" file download --no-progress "b2://${BUCKET}/${key}" "$temporary" \
-          > "$download_log" 2>&1 \
-          || download_return_code=$?
-      fi
-      if [ "$download_return_code" -ne 0 ]; then
+    observed=""
+    if [ "$item_prefetched" -eq 1 ]; then
+      render_progress "$completed_work" "$total_work" "$item_index" "$item_count" "$(progress_subject "$relative")"
+      wait_for_prefetch "$item_index"
+      if [ "$PREFETCH_RESULT" != "OK" ]; then
         progress_newline
         say "\n${R}  Download failed on ${relative}; existing file was not replaced.${X}"
-        tail -20 "$download_log" >&2
+        tail -20 "${PREFETCH_DIR}/${item_index}.log" 2>/dev/null >&2
         exit 1
       fi
+      temporary="$PREFETCH_TEMP"
+      temp_relative="${temporary#"${DEST_ABS}"/}"
       observed="$(fs_guard hash "$temp_relative")" || exit 1
+    else
+      temporary="$(mktemp "${TEMP_ROOT}/object.XXXXXX")" || exit 1
+      chmod 600 "$temporary"
+      temp_relative="${temporary#"${DEST_ABS}"/}"
+      if [ "$state" = "reused-local" ] && [ -n "$reuse_source" ]; then
+        if observed="$(fs_guard copy "$reuse_source" "$temporary")"; then
+          IFS=$'\t' read -r observed_size observed_sha1 observed_sha256 <<EOF
+$observed
+EOF
+          if [ "$observed_size" != "$size" ] \
+            || { [ "$remote_sha1" != "unverified" ] && [ "$observed_sha1" != "$remote_sha1" ]; } \
+            || { [ "$expected_sha256" != "unbound" ] && [ "$observed_sha256" != "$expected_sha256" ]; }; then
+            progress_newline
+            say "  ${Y}Local reuse candidate changed; downloading ${relative}.${X}"
+            observed=""
+          else
+            [ ! -t 1 ] && say "    ${D}reused verified local content from ${reuse_source}${X}"
+          fi
+        else
+          progress_newline
+          say "  ${Y}Local reuse candidate became unavailable; downloading ${relative}.${X}"
+          observed=""
+        fi
+      fi
+      if [ -z "$observed" ]; then
+        download_return_code=0
+        download_log="${TEMP_ROOT}/b2-download.log"
+        if [ -t 1 ]; then
+          "${B2_RUN[@]}" file download --no-progress \
+            --max-download-streams-per-file "$MAX_STREAMS_PER_FILE" \
+            "b2://${BUCKET}/${key}" "$temporary" \
+            > "$download_log" 2>&1 &
+          download_process_id=$!
+          while kill -0 "$download_process_id" 2>/dev/null; do
+            partial_bytes=$(wc -c < "$temporary" | tr -d ' ')
+            render_progress "$((completed_work + partial_bytes))" "$total_work" \
+              "$item_index" "$item_count" "$(progress_subject "$relative")"
+            sleep 1
+          done
+          wait "$download_process_id" || download_return_code=$?
+          download_process_id=""
+        else
+          "${B2_RUN[@]}" file download --no-progress \
+            --max-download-streams-per-file "$MAX_STREAMS_PER_FILE" \
+            "b2://${BUCKET}/${key}" "$temporary" \
+            > "$download_log" 2>&1 \
+            || download_return_code=$?
+        fi
+        if [ "$download_return_code" -ne 0 ]; then
+          progress_newline
+          say "\n${R}  Download failed on ${relative}; existing file was not replaced.${X}"
+          tail -20 "$download_log" >&2
+          exit 1
+        fi
+        observed="$(fs_guard hash "$temp_relative")" || exit 1
+      fi
     fi
     IFS=$'\t' read -r observed_size observed_sha1 observed_sha256 <<EOF
 $observed
@@ -2401,8 +2552,16 @@ EOF
     completed_work=$((completed_work + size))
     render_progress "$completed_work" "$total_work" "$item_index" "$item_count" "$(progress_subject "$relative")"
     log_event "file finish index=${item_index}/${item_count} bytes=${size} path=${relative} proof=${proof}"
+    # Return the pipeline slot only now, after the item is verified and installed,
+    # so the producer never runs more than $JOBS objects ahead of consumption.
+    [ "$item_prefetched" -eq 1 ] && printf '\n' >&9
   done < "$TODO"
   progress_newline
+  if [ "$JOBS" -gt 1 ]; then
+    wait "$PREFETCH_PRODUCER_PID" 2>/dev/null || true
+    PREFETCH_PRODUCER_PID=""
+    exec 9>&-
+  fi
 fi
 
 render_bundle_guides() {

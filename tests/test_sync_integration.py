@@ -22,17 +22,23 @@ def _run(client: FakeGenomeSync, *arguments: str) -> subprocess.CompletedProcess
     )
 
 
-def _setup(client: FakeGenomeSync, omit: str) -> subprocess.CompletedProcess[str]:
+def _setup(
+    client: FakeGenomeSync,
+    omit: str,
+    *extra_arguments: str,
+    destination: str | None = None,
+) -> subprocess.CompletedProcess[str]:
     completed = _run(
         client,
         "setup",
         "--dest",
-        str(client.destination),
+        destination if destination is not None else str(client.destination),
         "--only",
         "lab",
         "--omit-large",
         omit,
         "--yes",
+        *extra_arguments,
         client.donor,
     )
     assert completed.returncode == 0, completed.stderr + completed.stdout
@@ -421,3 +427,86 @@ def test_corrupt_retained_file_is_reported_unavailable(
     assert manifest["materialization"]["retained_unavailable_file_count"] == 1
     assert manifest["materialization"]["unavailable_file_count"] == 0
     assert manifest["materialization"]["complete"] is True
+
+
+def test_jobs_four_downloads_every_object_with_correct_bytes(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _setup(client, "none", "--jobs", "4")
+
+    for relative, content in client.payloads.items():
+        landed = client.destination / relative
+        assert landed.read_bytes() == content, relative
+    # The plan and completion objects must land too, not just the payloads.
+    assert (client.destination / "shortread/lab/lab_manifest.json").exists()
+    assert (client.destination / "shortread/lab/_COMPLETE.json").exists()
+    manifest = _manifest(client)
+    assert manifest["materialization"]["complete"] is True
+    for relative in client.payloads:
+        assert relative in manifest["files"]
+
+
+def test_jobs_one_and_four_produce_identical_file_records(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    serial_destination = client.destination.parent / "genome-serial"
+    parallel_destination = client.destination.parent / "genome-parallel"
+
+    _setup(client, "none", "--jobs", "1", destination=str(serial_destination))
+    _setup(client, "none", "--jobs", "4", destination=str(parallel_destination))
+
+    serial_manifest = json.loads(
+        (serial_destination / ".genome-manifest.json").read_text()
+    )
+    parallel_manifest = json.loads(
+        (parallel_destination / ".genome-manifest.json").read_text()
+    )
+    assert serial_manifest["files"], "expected downloaded file records"
+    assert serial_manifest["files"] == parallel_manifest["files"]
+
+
+def test_jobs_four_mid_run_fetch_failure_fails_closed(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    # A completed snapshot, then corrupt several payloads so a re-sync must
+    # re-download them concurrently under --jobs 4.
+    _setup(client, "none", "--jobs", "4")
+    preexisting = b"PRE-EXISTING-LOCAL-BYTES-DO-NOT-REPLACE"
+    survivor_relative = "shortread/lab/payload-4.bin"
+    for relative in (
+        "shortread/lab/payload-2.bin",
+        survivor_relative,
+        "shortread/lab/payload-6.bin",
+    ):
+        (client.destination / relative).write_bytes(preexisting)
+
+    failing_environment = dict(client.environment)
+    failing_environment["FAKE_B2_FAIL_DOWNLOAD_SUFFIX"] = "payload-4.bin"
+    completed = subprocess.run(
+        [client.command, "sync", "--omit-large", "none", "--yes", "--jobs", "4"],
+        env=failing_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert (
+        "Download failed on shortread/lab/payload-4.bin" in completed.stdout
+    ), completed.stdout + completed.stderr
+    # The failed object's pre-existing on-disk copy was never atomically replaced.
+    assert (client.destination / survivor_relative).read_bytes() == preexisting
+
+
+@pytest.mark.parametrize("bad_jobs", ["0", "99", "abc"])
+def test_jobs_rejects_out_of_range_or_non_numeric(
+    fake_genome_sync: FakeGenomeSync,
+    bad_jobs: str,
+) -> None:
+    client = fake_genome_sync
+    completed = _run(client, "sync", "--jobs", bad_jobs, "--omit-large", "none", "--yes")
+    assert completed.returncode != 0
+    assert "--jobs must be" in completed.stderr, completed.stderr + completed.stdout

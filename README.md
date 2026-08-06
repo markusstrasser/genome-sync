@@ -68,6 +68,26 @@ This exists because unconditional pruning is not safe against a bad remote plan:
 on 2026-07-29 a broken 32-stage active plan pruned a donor's 15.15 GB local
 snapshot down to 0.78 GB.
 
+## Concurrent downloads
+
+Object downloads run concurrently. `--jobs N` (default 4, range 1..16) bounds how
+many objects are fetched in parallel:
+
+```bash
+genome-sync sync --jobs 8 --yes
+```
+
+Only the network fetch is parallel. Worker processes download each object into a
+private temp file under the download workspace and never touch the destination
+tree; the main process still consumes items in snapshot order and runs the same
+serial size + SHA-1 + SHA-256 verification, no-follow tree validation, and atomic
+replacement for every object, exactly as it did serially. A worker fetch failure
+fails the whole sync closed, leaving existing files unreplaced. Prefetch depth is
+capped at N objects, so temp usage never exceeds the serial peak by more than the
+extra in-flight objects. `--jobs 1` is the fully serial path. Each `b2 file
+download` also uses `--max-download-streams-per-file`, so a single large object is
+fetched over multiple streams even at `--jobs 1`.
+
 The existing security boundary remains in the bundled client: canonical donor
 and relative paths, no-follow destination traversal, private atomic config and
 log writes, OS credential storage, exact B2 prefix checks, activation rollback
@@ -82,6 +102,9 @@ uv run pytest
 
 The integration suite uses a deterministic local B2 double. It covers saved
 choices, partial-manifest honesty, adding an omitted payload later, the
-no-delete-on-deselect invariant, and retention-by-default (kept across repeated
-syncs, removed only under `--prune`, corrupt leftovers disclosed as unavailable)
-without contacting Backblaze.
+no-delete-on-deselect invariant, retention-by-default (kept across repeated
+syncs, removed only under `--prune`, corrupt leftovers disclosed as unavailable),
+and concurrent downloads (`--jobs 4` lands every object with correct bytes,
+`--jobs 4` and `--jobs 1` produce identical manifest records, a mid-run fetch
+failure still fails closed without replacing pre-existing files, and out-of-range
+or non-numeric `--jobs` values are rejected) without contacting Backblaze.
