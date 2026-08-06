@@ -36,6 +36,8 @@ OPTIONS:
       --exclude WHICH  skip one of: lab | results | ensemble
       --omit-large N   omit numbered optional payloads after inventory validation
                        (comma-separated, or "none" to include every payload)
+      --prune          delete previously managed files that are absent from the
+                       new active snapshot (default: keep them)
   -y, --yes            do not ask for confirmation
   -n, --dry-run        show what would change, then stop
   -h, --help           show this help
@@ -65,6 +67,10 @@ SETUP AND UPDATES:
   include all of them. Noninteractive callers use --omit-large N (or none).
   Downloads are differential. Deselecting a payload never deletes a previously
   downloaded copy; the local manifest records partial materialization explicitly.
+  Retention is the default: a previously managed file that is absent from the
+  new active snapshot stays on disk and moves to the manifest's `retained_files`
+  map instead of `files`. Deleting those files is a separate explicit choice —
+  pass --prune when you want them removed.
   `genome-sync destination <directory>` changes only the saved destination. It
   uses the existing Keychain/Credential Locker entry and never moves or syncs
   files; the directory must already exist.
@@ -78,7 +84,7 @@ case "${1:-}" in
 esac
 DEST=""; DEST_EXPLICIT=0; ONLY=""; EXCLUDE=""; FILTER_EXPLICIT=0
 OMIT_LARGE_SPEC=""; OMIT_LARGE_EXPLICIT=0; SAVED_OMITTED_JSON="[]"
-DRYRUN=0; ASSUME_YES=0; POS=()
+PRUNE=0; DRYRUN=0; ASSUME_YES=0; POS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -91,6 +97,7 @@ while [ $# -gt 0 ]; do
       OMIT_LARGE_EXPLICIT=1
       shift 2
       ;;
+    --prune) PRUNE=1; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     -n|--dry-run) DRYRUN=1; shift ;;
     --) shift; while [ $# -gt 0 ]; do POS+=("$1"); shift; done ;;
@@ -416,7 +423,7 @@ case "$COMMAND" in
     ;;
   status)
     if [ -n "$DONOR" ] || [ "$DEST_EXPLICIT" -eq 1 ] || [ -n "$ONLY" ] || [ -n "$EXCLUDE" ] \
-      || [ "$OMIT_LARGE_EXPLICIT" -eq 1 ] || [ "$DRYRUN" -eq 1 ]; then
+      || [ "$OMIT_LARGE_EXPLICIT" -eq 1 ] || [ "$PRUNE" -eq 1 ] || [ "$DRYRUN" -eq 1 ]; then
       echo "error: status accepts no donor or sync options" >&2
       exit 1
     fi
@@ -451,7 +458,7 @@ case "$COMMAND" in
   destination)
     if [ -z "$DONOR" ] || [ "$DEST_EXPLICIT" -eq 1 ] || [ -n "$ONLY" ] \
       || [ -n "$EXCLUDE" ] || [ "$OMIT_LARGE_EXPLICIT" -eq 1 ] \
-      || [ "$DRYRUN" -eq 1 ] || [ "$ASSUME_YES" -eq 1 ]; then
+      || [ "$PRUNE" -eq 1 ] || [ "$DRYRUN" -eq 1 ] || [ "$ASSUME_YES" -eq 1 ]; then
       echo "error: usage: genome-sync destination <directory>" >&2
       exit 1
     fi
@@ -2112,9 +2119,17 @@ manifest_path = root / manifest_name
 if manifest_donor and manifest_path.is_file() and not manifest_path.is_symlink():
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     files = manifest.get("files")
-    if manifest.get("donor") != manifest_donor or not isinstance(files, dict):
+    retained = manifest.get("retained_files", {})
+    if (
+        manifest.get("donor") != manifest_donor
+        or not isinstance(files, dict)
+        or not isinstance(retained, dict)
+    ):
         raise SystemExit("existing local genome manifest is malformed")
-    for relative, record in sorted(files.items()):
+    # Retained files are still managed bytes: they stay reusable, and an explicit
+    # --prune on a later run must still be able to see and remove them.
+    managed = {**files, **retained}
+    for relative, record in sorted(managed.items()):
         if not isinstance(relative, str) or not isinstance(record, dict):
             continue
         path = root / relative
@@ -2229,10 +2244,18 @@ if [ -n "$existing_donor" ]; then
   done < "$LOCAL_INDEX"
 fi
 prune_n=$(wc -l < "$PRUNES" | tr -d ' ')
+absent_summary=""
+if [ "$prune_n" -gt 0 ]; then
+  if [ "$PRUNE" -eq 1 ]; then
+    absent_summary=" · ${R}${prune_n} to remove${X}"
+  else
+    absent_summary=" · ${D}${prune_n} kept (no longer in the active snapshot)${X}"
+  fi
+fi
 
-say "  ${B}Changes:${X} ${G}${new} new${X} · ${BL}${changed} updated${X} · ${D}${unchanged} unchanged${X}$( [ "$reused" -gt 0 ] && printf " · ${G}%s reused locally%s" "$reused" "$X" )$( [ "$prune_n" -gt 0 ] && printf " · ${R}%s to remove${X}" "$prune_n" )"
+say "  ${B}Changes:${X} ${G}${new} new${X} · ${BL}${changed} updated${X} · ${D}${unchanged} unchanged${X}$( [ "$reused" -gt 0 ] && printf " · ${G}%s reused locally%s" "$reused" "$X" )${absent_summary}"
 say "  ${B}Transfer:${X} $(human "$total_xfer") ${B}→${X} ${DEST_ABS}"
-log_event "preview new=${new} updated=${changed} unchanged=${unchanged} reused=${reused} remove=${prune_n} transfer_bytes=${total_xfer}"
+log_event "preview new=${new} updated=${changed} unchanged=${unchanged} reused=${reused} absent_remotely=${prune_n} prune=${PRUNE} transfer_bytes=${total_xfer}"
 if [ "$DRYRUN" -eq 1 ]; then
   [ "$reused" -gt 0 ] && {
     say "\n  ${D}would reuse ${reused} local file(s):${X}"
@@ -2250,11 +2273,16 @@ if [ "$DRYRUN" -eq 1 ]; then
     ' "$TODO"
   }
   [ "$prune_n" -gt 0 ] && {
-    say "\n  ${D}would remove ${prune_n} previously managed file(s):${X}"
+    if [ "$PRUNE" -eq 1 ]; then
+      say "\n  ${D}would remove ${prune_n} previously managed file(s):${X}"
+    else
+      say "\n  ${D}would keep ${prune_n} previously managed file(s) no longer in the active snapshot:${X}"
+    fi
     awk -v limit=25 '
       { if (NR <= limit) print "    " $0 }
       END { if (NR > limit) printf "    … %d more files\n", NR - limit }
     ' "$PRUNES"
+    [ "$PRUNE" -eq 1 ] || say "    ${D}(pass --prune to delete them instead)${X}"
   }
   if [ "$(tr -d '[:space:]' < "$ACTIVE_RESULTS")" != "{}" ]; then
     say "\n  ${D}would refresh the donor-root and assay Markdown guides${X}"
@@ -2265,7 +2293,7 @@ if [ "$DRYRUN" -eq 1 ]; then
 fi
 
 confirmation_required=0
-if [ -s "$TODO" ] || [ "$prune_n" -gt 0 ]; then
+if [ -s "$TODO" ] || { [ "$PRUNE" -eq 1 ] && [ "$prune_n" -gt 0 ]; }; then
   confirmation_required=1
 elif { [ "$COMMAND" = "setup" ] || [ "$COMMAND" = "sync" ]; } \
   && [ "$ASSUME_YES" -eq 0 ] && [ "$FILTER_EXPLICIT" -eq 0 ] \
@@ -2389,13 +2417,16 @@ from pathlib import Path
 
 manifest_path, guide_root = sys.argv[1:]
 manifest = json.load(open(manifest_path, encoding="utf-8"))
-if not isinstance(manifest, dict) or manifest.get("schema") != 4:
-    raise SystemExit("finalized local manifest must use schema 4")
+if not isinstance(manifest, dict) or manifest.get("schema") != 5:
+    raise SystemExit("finalized local manifest must use schema 5")
 active = manifest.get("active_results")
 files = manifest.get("files")
 omitted = manifest.get("omitted_files")
 unavailable = manifest.get("unavailable_files")
-if not all(isinstance(value, dict) for value in (active, files, omitted, unavailable)):
+retained = manifest.get("retained_files")
+if not all(
+    isinstance(value, dict) for value in (active, files, omitted, unavailable, retained)
+):
     raise SystemExit("finalized local manifest materialization maps are malformed")
 if not active:
     raise SystemExit(0)
@@ -2405,11 +2436,12 @@ root_lines = [
     "This index is generated from `.genome-manifest.json`. Its `active_results`",
     "map binds the verified remote activation for each assay. The manifest's",
     "`materialization`, `omitted_files`, and `unavailable_files` fields say which activated bytes are local.",
+    "`retained_files` lists kept files that the active snapshot no longer names; they are not activated bytes.",
     "",
     "| Assay | Sample | Updated | Local | Results plan | Results index |",
     "|---|---|---|---|---|---|",
 ]
-known_paths = set(files) | set(omitted) | set(unavailable)
+known_paths = set(files) | set(omitted) | set(unavailable) | set(retained)
 lab_assays = {
     relative.split("/", 1)[0]
     for relative in known_paths
@@ -2502,6 +2534,7 @@ for assay, record in sorted(active.items()):
         "",
         "Read `../.genome-manifest.json` first. Its `active_results` entry identifies the exact plan and local results path. Then read `results/AGENTS.md` for the evidence and interpretation contract and `results/TOC.md` to locate stages.",
         "The remote activation and the local materialization are separate facts. Check `materialization.complete`, `omitted_files`, and `unavailable_files` before claiming a payload is local.",
+        "Files in `retained_files` are kept local bytes from an earlier snapshot; they are outside the current activation, so never cite them as activated evidence. `unavailable_files` entries flagged `retained` describe those leftovers too, and are excluded from every `materialization` count.",
         "",
         "Treat `lab/` as sequencing evidence, not interpretation. Validate `lab/lab_manifest.json` and `lab/_COMPLETE.json` before relying on it. Never upload donor-specific sequence, variants, genotypes, or findings to a network service without explicit informed permission.",
         "",
@@ -2524,7 +2557,7 @@ PYEOF
   done < <(find "$guide_root" -mindepth 2 -maxdepth 2 -type f -name '*.md' | sort)
 }
 
-if [ "$prune_n" -gt 0 ]; then
+if [ "$prune_n" -gt 0 ] && [ "$PRUNE" -eq 1 ]; then
   say "\n  ${R}Removing ${prune_n} file(s) absent remotely:${X}"
   while IFS= read -r relative; do
     [ -n "$relative" ] || continue
@@ -2533,11 +2566,19 @@ if [ "$prune_n" -gt 0 ]; then
     fs_guard prune-empty-parents "$relative" || exit 1
     log_event "file remove path=${relative}"
   done < "$PRUNES"
+elif [ "$prune_n" -gt 0 ]; then
+  say "\n  ${D}Keeping ${prune_n} file(s) no longer in the active snapshot:${X}"
+  while IFS= read -r relative; do
+    [ -n "$relative" ] || continue
+    say "    ${D}·${X} ${relative}"
+    log_event "file retain path=${relative}"
+  done < "$PRUNES"
+  say "    ${D}(pass --prune to delete them instead)${X}"
 fi
 
 fs_guard validate-tree || exit 1
 manifest_temporary="$TEMP_ROOT/manifest.json"
-"${PY[@]}" - "$manifest_temporary" "$DONOR" "$BUCKET" "$VERIFIED" "$FILTERED" "$OMITTED" "$HASHES" "$DEST_ABS/$MANIFEST" "$ONLY" "$EXCLUDE" "$ACTIVE_RESULTS" "$DEST_ABS" <<'PYEOF' \
+"${PY[@]}" - "$manifest_temporary" "$DONOR" "$BUCKET" "$VERIFIED" "$FILTERED" "$OMITTED" "$HASHES" "$DEST_ABS/$MANIFEST" "$ONLY" "$EXCLUDE" "$ACTIVE_RESULTS" "$DEST_ABS" "$PRUNE" <<'PYEOF' \
   || { say "${R}could not build a complete local manifest${X}"; exit 1; }
 import datetime
 import hashlib
@@ -2561,7 +2602,9 @@ from pathlib import Path, PurePosixPath
     exclude,
     active_results_path,
     location,
+    prune_requested_text,
 ) = sys.argv[1:]
+prune_requested = prune_requested_text == "1"
 
 def section_of(relative):
     if relative.startswith("ensemble/"):
@@ -2723,12 +2766,30 @@ if not isinstance(existing_unavailable, dict) or any(
     not isinstance(item, dict) for item in existing_unavailable.values()
 ):
     raise SystemExit("existing unavailable_files must be an object of records")
+existing_retained = existing.get("retained_files", {})
+if not isinstance(existing_retained, dict) or any(
+    not isinstance(item, dict) for item in existing_retained.values()
+):
+    raise SystemExit("existing retained_files must be an object of records")
+retained_and_materialized = sorted(set(existing_files) & set(existing_retained))
+if retained_and_materialized:
+    raise SystemExit(
+        f"existing file is both materialized and retained: {retained_and_materialized[0]}"
+    )
+# A retained record that failed its byte audit is disclosed for that run only. It
+# describes bytes outside the active snapshot, so reading it back as active state
+# would pin `materialization` to a partial that the snapshot never had.
+existing_active_unavailable = {
+    relative: record
+    for relative, record in existing_unavailable.items()
+    if record.get("retained") is not True
+}
 carried_candidates = {
     relative: record
     for relative, record in existing_files.items()
     if section_of(relative) not in requested_sections
 }
-for relative, record in existing_unavailable.items():
+for relative, record in existing_active_unavailable.items():
     if section_of(relative) in requested_sections:
         continue
     if relative in carried_candidates:
@@ -2744,6 +2805,31 @@ for relative, record in sorted(carried_candidates.items()):
         merged_unavailable[relative] = unavailable
 merged_files.update(observed)
 
+# Retention is the default. Previously managed bytes that the new active snapshot
+# no longer names stay on disk unless --prune was given, and they are recorded
+# apart from `files` so nothing reads them as part of that snapshot.
+retained_candidates = {
+    relative: record
+    for relative, record in existing_retained.items()
+    if section_of(relative) not in requested_sections
+}
+if not prune_requested:
+    for previously_managed in (existing_files, existing_retained):
+        for relative, record in previously_managed.items():
+            if section_of(relative) not in requested_sections or relative in verified:
+                continue
+            retained_candidates[relative] = record
+merged_retained = {}
+retained_unavailable = {}
+for relative, record in sorted(retained_candidates.items()):
+    if relative in merged_files:
+        raise SystemExit(f"retained path is also an active manifest path: {relative}")
+    carried, unavailable = audit_carried_file(relative, record)
+    if carried is not None:
+        merged_retained[relative] = {**carried, "reason": "absent_from_active_snapshot"}
+    else:
+        retained_unavailable[relative] = {**unavailable, "retained": True}
+
 existing_omitted = existing.get("omitted_files", {})
 if not isinstance(existing_omitted, dict) or any(
     not isinstance(item, dict) for item in existing_omitted.values()
@@ -2755,12 +2841,22 @@ merged_omitted = {
     if section_of(relative) not in requested_sections
 }
 merged_omitted.update(omitted)
-if (
-    set(merged_files) & set(merged_omitted)
-    or set(merged_files) & set(merged_unavailable)
-    or set(merged_omitted) & set(merged_unavailable)
-):
-    raise SystemExit("materialized, omitted, and unavailable manifest paths must be disjoint")
+all_unavailable = {**merged_unavailable, **retained_unavailable}
+manifest_partitions = (
+    ("materialized", set(merged_files)),
+    ("omitted", set(merged_omitted)),
+    ("unavailable", set(all_unavailable)),
+    ("retained", set(merged_retained)),
+)
+if len(merged_unavailable) + len(retained_unavailable) != len(all_unavailable):
+    raise SystemExit("active and retained unavailable manifest paths must be disjoint")
+for index, (left_label, left_paths) in enumerate(manifest_partitions):
+    for right_label, right_paths in manifest_partitions[index + 1 :]:
+        overlap = sorted(left_paths & right_paths)
+        if overlap:
+            raise SystemExit(
+                f"{left_label} and {right_label} manifest paths must be disjoint: {overlap[0]}"
+            )
 
 if "results" in requested_sections:
     active_results = json.load(open(active_results_path, encoding="utf-8"))
@@ -2838,7 +2934,7 @@ for section in requested_sections:
     section_sync[section] = synced_at
 payload = {
     "tool": "download-genome.sh",
-    "schema": 4,
+    "schema": 5,
     "donor": donor,
     "bucket": bucket,
     "location": location,
@@ -2868,9 +2964,16 @@ payload = {
         "omitted_bytes": sum(record["size"] for record in merged_omitted.values()),
         "unavailable_file_count": len(merged_unavailable),
         "unavailable_bytes": sum(record["size"] for record in merged_unavailable.values()),
+        "retained_file_count": len(merged_retained),
+        "retained_bytes": sum(record["size"] for record in merged_retained.values()),
+        "retained_unavailable_file_count": len(retained_unavailable),
+        "retained_unavailable_bytes": sum(
+            record["size"] for record in retained_unavailable.values()
+        ),
     },
     "omitted_files": dict(sorted(merged_omitted.items())),
-    "unavailable_files": dict(sorted(merged_unavailable.items())),
+    "unavailable_files": dict(sorted(all_unavailable.items())),
+    "retained_files": dict(sorted(merged_retained.items())),
     "files": dict(sorted(merged_files.items())),
 }
 with open(manifest_path, "w", encoding="utf-8") as destination:

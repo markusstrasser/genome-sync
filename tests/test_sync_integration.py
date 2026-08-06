@@ -78,15 +78,30 @@ def _seed_legacy_result_records(client: FakeGenomeSync) -> dict[str, bytes]:
     (assay_root / "README.md").write_text(
         "# Assay: shortread\n\n- Local materialization includes every activated payload.\n"
     )
-    (assay_root / "TOC.md").write_text(
-        "# shortread contents\n\nLocal materialization: complete\n"
-    )
+    (assay_root / "TOC.md").write_text("# shortread contents\n\nLocal materialization: complete\n")
     (client.destination / "TOC.md").write_text(
         "# Active genome bundles\n\n| shortread | complete |\n"
     )
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     os.chmod(manifest_path, 0o600)
     return contents
+
+
+def _seed_absent_remote_lab_file(client: FakeGenomeSync, relative: str, content: bytes) -> None:
+    """Record a managed lab file locally that the remote snapshot does not carry."""
+    path = client.destination / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    manifest_path = client.destination / ".genome-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["files"][relative] = {
+        "size": len(content),
+        "remote_sha1": hashlib.sha1(content, usedforsecurity=False).hexdigest(),
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "proof": "activated_plan_sha256_verified",
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    os.chmod(manifest_path, 0o600)
 
 
 @pytest.mark.parametrize(
@@ -183,9 +198,9 @@ def test_omitted_payload_can_be_added_later(fake_genome_sync: FakeGenomeSync) ->
     assert partial["materialization"]["complete"] is False
     assert "shortread/lab/payload-1.bin" in partial["omitted_files"]
     assert "shortread/lab/payload-1.bin" not in partial["files"]
-    assert partial["materialization"]["verified_remote_file_count"] == len(
-        partial["files"]
-    ) + len(partial["omitted_files"])
+    assert partial["materialization"]["verified_remote_file_count"] == len(partial["files"]) + len(
+        partial["omitted_files"]
+    )
     assert "shortread/lab/lab_manifest.json" in partial["files"]
     assert "shortread/lab/_COMPLETE.json" in partial["files"]
     outside_current_inventory = "longread/results/huge.cram"
@@ -290,15 +305,14 @@ def test_lab_only_sync_audits_carried_results_and_normalizes_active_record(
     corrupt_relative = "shortread/results/corrupt-result.bin"
     missing_relative = "shortread/results/missing-result.bin"
     intact_relative = "shortread/results/intact-result.bin"
-    (client.destination / corrupt_relative).write_bytes(
-        b"X" * len(contents[corrupt_relative])
-    )
+    (client.destination / corrupt_relative).write_bytes(b"X" * len(contents[corrupt_relative]))
     (client.destination / missing_relative).unlink()
 
     completed = _run(client, "sync", "--omit-large", "none", "--yes")
     assert completed.returncode == 0, completed.stderr + completed.stdout
     manifest = _manifest(client)
-    assert manifest["schema"] == 4
+    assert manifest["schema"] == 5
+    assert manifest["retained_files"] == {}
     active = manifest["active_results"]["shortread"]
     assert active["remote_activation_validated"] is True
     assert active["omitted_file_count"] == 0
@@ -307,14 +321,8 @@ def test_lab_only_sync_audits_carried_results_and_normalizes_active_record(
     assert intact_relative not in manifest["unavailable_files"]
     assert corrupt_relative not in manifest["files"]
     assert missing_relative not in manifest["files"]
-    assert (
-        manifest["unavailable_files"][corrupt_relative]["reason"]
-        == "local_sha256_mismatch"
-    )
-    assert (
-        manifest["unavailable_files"][missing_relative]["reason"]
-        == "missing_local_file"
-    )
+    assert manifest["unavailable_files"][corrupt_relative]["reason"] == "local_sha256_mismatch"
+    assert manifest["unavailable_files"][missing_relative]["reason"] == "missing_local_file"
     assert manifest["materialization"]["complete"] is False
     assert manifest["materialization"]["unavailable_file_count"] == 2
     assert active["local_materialization_complete"] is False
@@ -328,3 +336,88 @@ def test_lab_only_sync_audits_carried_results_and_normalizes_active_record(
     assert "Local materialization is partial: 2 missing or corrupt." in assay_readme
     assert "Local materialization: partial" in assay_toc
     assert "| shortread | sample-001 | 2026-07-31T00:00:00Z | partial |" in root_toc
+
+
+RETIRED_RELATIVE = "shortread/lab/retired-payload.bin"
+RETIRED_CONTENT = b"retired-lab-payload"
+
+
+def test_absent_remote_file_is_retained_by_default(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _setup(client, "none")
+    _seed_absent_remote_lab_file(client, RETIRED_RELATIVE, RETIRED_CONTENT)
+    retired_path = client.destination / RETIRED_RELATIVE
+
+    completed = _run(client, "sync", "--omit-large", "none", "--yes")
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    assert "1 kept (no longer in the active snapshot)" in completed.stdout
+    assert "to remove" not in completed.stdout
+    assert retired_path.read_bytes() == RETIRED_CONTENT
+
+    manifest = _manifest(client)
+    assert manifest["schema"] == 5
+    assert RETIRED_RELATIVE not in manifest["files"]
+    assert RETIRED_RELATIVE not in manifest["unavailable_files"]
+    retained = manifest["retained_files"][RETIRED_RELATIVE]
+    assert retained["size"] == len(RETIRED_CONTENT)
+    assert retained["sha256"] == hashlib.sha256(RETIRED_CONTENT).hexdigest()
+    assert retained["proof"] == "activated_plan_sha256_verified"
+    assert retained["reason"] == "absent_from_active_snapshot"
+    assert manifest["materialization"]["retained_file_count"] == 1
+    assert manifest["materialization"]["retained_bytes"] == len(RETIRED_CONTENT)
+    assert manifest["materialization"]["complete"] is True
+
+    repeated = _run(client, "sync", "--omit-large", "none", "--yes")
+    assert repeated.returncode == 0, repeated.stderr + repeated.stdout
+    assert retired_path.read_bytes() == RETIRED_CONTENT
+    assert RETIRED_RELATIVE in _manifest(client)["retained_files"]
+
+
+def test_prune_removes_file_absent_from_active_snapshot(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _setup(client, "none")
+    _seed_absent_remote_lab_file(client, RETIRED_RELATIVE, RETIRED_CONTENT)
+    retired_path = client.destination / RETIRED_RELATIVE
+
+    completed = _run(client, "sync", "--omit-large", "none", "--prune", "--yes")
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    assert "1 to remove" in completed.stdout
+    assert "kept (no longer in the active snapshot)" not in completed.stdout
+    assert not retired_path.exists()
+
+    manifest = _manifest(client)
+    assert manifest["retained_files"] == {}
+    assert RETIRED_RELATIVE not in manifest["files"]
+    assert RETIRED_RELATIVE not in manifest["unavailable_files"]
+    assert manifest["materialization"]["retained_file_count"] == 0
+    assert manifest["materialization"]["complete"] is True
+
+
+def test_corrupt_retained_file_is_reported_unavailable(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _setup(client, "none")
+    _seed_absent_remote_lab_file(client, RETIRED_RELATIVE, RETIRED_CONTENT)
+    retired_path = client.destination / RETIRED_RELATIVE
+    corrupted = b"X" * len(RETIRED_CONTENT)
+    retired_path.write_bytes(corrupted)
+
+    completed = _run(client, "sync", "--omit-large", "none", "--yes")
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    assert retired_path.read_bytes() == corrupted
+
+    manifest = _manifest(client)
+    assert RETIRED_RELATIVE not in manifest["retained_files"]
+    assert RETIRED_RELATIVE not in manifest["files"]
+    unavailable = manifest["unavailable_files"][RETIRED_RELATIVE]
+    assert unavailable["reason"] == "local_sha256_mismatch"
+    assert unavailable["retained"] is True
+    assert unavailable["observed_sha256"] == hashlib.sha256(corrupted).hexdigest()
+    assert manifest["materialization"]["retained_unavailable_file_count"] == 1
+    assert manifest["materialization"]["unavailable_file_count"] == 0
+    assert manifest["materialization"]["complete"] is True
