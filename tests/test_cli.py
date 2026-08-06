@@ -92,8 +92,11 @@ def test_refresh_without_uv_on_path_is_never_fatal(tmp_path: Path) -> None:
         cli._refresh_from_source()  # must return, not raise
 
 
-def test_published_source_is_the_public_repository() -> None:
-    assert cli.SOURCE == "git+https://github.com/markusstrasser/genome-sync"
+def test_donors_track_the_released_branch_not_main() -> None:
+    # main is a candidate branch. Pointing donors at it would make every push a
+    # release, which is how the 2026-08-06 b2 process leak reached a pushed commit.
+    assert cli.SOURCE == "git+https://github.com/markusstrasser/genome-sync@released"
+    assert not cli.SOURCE.endswith("@main")
 
 
 def test_bundled_client_is_the_checkout_resource() -> None:

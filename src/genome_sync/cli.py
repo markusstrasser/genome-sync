@@ -18,7 +18,13 @@ from importlib import resources
 from pathlib import Path
 from typing import NoReturn
 
-SOURCE = "git+https://github.com/markusstrasser/genome-sync"
+# Donors track `released`, never `main`. `main` is a candidate branch: a commit only
+# reaches a donor once `just donor-client-release` (in the genomics repo) has run both
+# this package's suite and the producer-consumer contract suite against it. That gate
+# exists because a commit can pass this repository's tests and still be wrong — the
+# 2026-08-06 prefetch change leaked b2 processes and only the contract suite caught it.
+# Rollback is `git branch -f released <good-sha>`, with no new code.
+SOURCE = "git+https://github.com/markusstrasser/genome-sync@released"
 DISABLE_VARIABLE = "GENOME_SYNC_NO_SELF_UPDATE"
 REFRESH_TIMEOUT_SECONDS = 60
 
