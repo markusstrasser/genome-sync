@@ -49,3 +49,36 @@ currently cannot express that interactively at all.
 Neither is a data-integrity defect: retention, hashing and the completion gate all
 behaved correctly on the same run (985 superseded files were kept, not pruned;
 plan a9994eaa6df6 matched the freshly published snapshot).
+
+## Defect 3 — a missing donor arg silently uses the last-synced donor, even against a key scoped elsewhere
+
+Observed 2026-08-06 by the operator, dogfooding syn6's donor command.
+
+    uvx --from git+…@released genome-sync        # no positional donor
+    →  Your genome data — jw
+       Destination: /Volumes/2TBPNY/jw-genome
+       Source:      b2://computational-genomics/jw/
+    →  ERROR: unauthorized … restricted to files that start with 'syn6/'
+
+`jw` came from `~/.config/genome-sync/config.json` (the operator's own saved setup),
+not from anything remote. **No cross-donor exposure is possible:** with no config the
+client exits at `download-genome.sh:177`, and a donor arg that contradicts the config is
+refused at :410. There is no server-side donor discovery. The B2 key was additionally
+prefix-restricted, so the listing failed server-side too.
+
+The defect is the asymmetry: an explicit **mismatched** donor is refused, a **missing**
+one is silently filled from config (:390). That is fine for a donor — one identity per
+machine — and wrong for the operator, who holds several. With a master key rather than a
+syn6-scoped one, this run would have silently synced jw with no error at all.
+
+**Intended behaviour.** B2's own authorization response carries the key's `namePrefix`
+(the failure message already prints it). Compare it to the selected donor before planning
+and fail with the instruction rather than the symptom:
+
+    this key is scoped to syn6/, but the saved configuration selects donor jw
+    pass the donor explicitly:  genome-sync syn6
+
+Fixing the message is enough; do not remove the config fallback, which is the normal
+donor path. Requiring the positional donor whenever credentials are supplied through the
+environment (the uvx one-off shape, which by design has no memory) is the stricter
+alternative and also acceptable.
