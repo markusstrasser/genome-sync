@@ -45,15 +45,28 @@ genome-sync sync --omit-large none --yes
 ```
 
 An omitted payload can be added on any later run. Deselecting one never removes
-an already downloaded copy. `.genome-manifest.json` schema 4 separates the
+an already downloaded copy. `.genome-manifest.json` schema 5 separates the
 validated remote activation from local materialization through
-`materialization`, `omitted_files`, `unavailable_files`, and per-assay
-`local_materialization_complete` fields. Omitted payloads are not included in
-the manifest's `files` map. Files carried from a section outside the current
-sync are rehashed before being carried forward; missing or corrupt files move
-to `unavailable_files` and force materialization incomplete. Activation markers
-and remote manifests are control files: they remain mandatory and cannot be
-deselected.
+`materialization`, `omitted_files`, `unavailable_files`, `retained_files`, and
+per-assay `local_materialization_complete` fields. Omitted payloads are not
+included in the manifest's `files` map. Files carried from a section outside the
+current sync are rehashed before being carried forward; missing or corrupt files
+move to `unavailable_files` and force materialization incomplete. Activation
+markers and remote manifests are control files: they remain mandatory and cannot
+be deselected.
+
+Retention is the default. A previously managed file that the new active snapshot
+no longer names stays on disk and moves to `retained_files` — recorded apart from
+`files` so nothing reads it as part of that snapshot, and never citable as
+activated evidence. Deleting those files is a separate explicit choice:
+
+```bash
+genome-sync sync --prune
+```
+
+This exists because unconditional pruning is not safe against a bad remote plan:
+on 2026-07-29 a broken 32-stage active plan pruned a donor's 15.15 GB local
+snapshot down to 0.78 GB.
 
 The existing security boundary remains in the bundled client: canonical donor
 and relative paths, no-follow destination traversal, private atomic config and
@@ -68,5 +81,7 @@ uv run pytest
 ```
 
 The integration suite uses a deterministic local B2 double. It covers saved
-choices, partial-manifest honesty, adding an omitted payload later, and the
-no-delete-on-deselect invariant without contacting Backblaze.
+choices, partial-manifest honesty, adding an omitted payload later, the
+no-delete-on-deselect invariant, and retention-by-default (kept across repeated
+syncs, removed only under `--prune`, corrupt leftovers disclosed as unavailable)
+without contacting Backblaze.
