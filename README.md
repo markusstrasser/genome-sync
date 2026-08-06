@@ -5,20 +5,26 @@ console command while keeping the synchronization engine in its audited Bash
 form. The Python entry point replaces itself with Bash, so signals and exit
 codes come directly from the bundled client.
 
-The initial bundled resource was copied byte-for-byte from the tracked
-`scripts/donor/download-genome.sh` in the genomics repository. Its baseline
-SHA-256 is recorded in `src/genome_sync/UPSTREAM_SHA256`; later package changes
-extend that client in place.
+This repository is the client's only home. It began as a copy of a downloader
+tracked in the genomics repository; that copy and its secret-gist delivery path
+were deleted on 2026-08-06, because maintaining the same client in three places
+produced three different versions and shipped donors bytes that could never be
+updated.
 
-## Install from this checkout
+## Install
 
 ```bash
-uv tool install /Users/alien/Projects/genome-sync
+uv tool install --force git+https://github.com/markusstrasser/genome-sync
 genome-sync --help
 ```
 
-This repository currently supports local-path installation. It is not yet
-published to a package index.
+Donors never upgrade by hand. The entry point re-resolves this repository on every
+invocation, so the newest commit on `main` runs on the next sync. The refresh is
+best-effort — no `uv`, no network, a GitHub outage, or a timeout costs a newer
+client, never the ability to synchronize data that lives in B2. Set
+`GENOME_SYNC_NO_SELF_UPDATE=1` to disable it.
+
+Because `main` is what every donor resolves, treat a push there as a release.
 
 ## Configure and synchronize
 
