@@ -5,7 +5,7 @@ Both reproduce with the no-install one-off form:
     B2_... uvx --from git+https://github.com/markusstrasser/genome-sync@released \
       genome-sync --dest /Volumes/2TBPNY/syn6-genome syn6
 
-## 1. The one-off form never asks results vs lab vs both
+## 1. The one-off form never asks results vs lab vs both — FIXED
 
 Observed output: `Selection:   results and lab` — printed as a fact, never asked.
 
@@ -19,7 +19,14 @@ Fix: in the one-off path, when stdin/stdout are a TTY and neither `--only` nor
 `--exclude` was passed, prompt for results / lab / both before inventory. Keep the
 current fallback for non-TTY and `--yes`.
 
-## 2. The "largest optional payloads" list mixes lab and results
+**Fixed as described.** The section prompt's gate now fires for `one-off` as well as
+`sync`, reusing the same prompt loop. A one-off has no saved answer, so it displays
+`both` — Enter still gets everything, but as an answer rather than a fallback.
+Non-TTY and `--yes` are untouched. Covered by
+`test_one_off_run_asks_which_sections_to_sync` and
+`test_one_off_honours_an_explicit_section_without_asking`.
+
+## 2. The "largest optional payloads" list mixes lab and results — RESOLVED BY REMOVAL
 
 Observed:
 
@@ -40,11 +47,21 @@ choice, not a per-file one. If `--only lab` is selected, either skip the list
 entirely or list lab payloads explicitly labelled as such — but never interleave
 the two classes in one numbered set.
 
-## Why these matter together
+**Resolved by removing the feature, not by fixing the ranking.** The operator's call:
+per-file picking was ceremony on every sync to serve a rare case, and the numbered
+list was the wrong instrument for it either way. `--omit-large`, the ranking pass, the
+list, and the `Numbers to omit` prompt are gone; a sync downloads the selected sections
+whole. The config schema drops the saved-omission key (`v3` → `v4`; a v3 file on disk
+still loads, ignoring the key). Manifest schema 5 is unchanged — `materialization`,
+`omitted_files`, `unavailable_files` and `retained_files` are still written, and with
+nothing omittable they simply report complete.
 
-(1) silently opts the donor into 17.5 GB, and (2) then denies them the tool to
-trim what they did want. A donor who wants results-only and no 2.7 GB sqlite
-currently cannot express that interactively at all.
+## Why these mattered together
+
+(1) silently opted the donor into 17.5 GB, and (2) then denied them the tool to
+trim what they did want. Section choice — now asked on every interactive path —
+is the whole answer that remains: a donor who wants results-only can say so, and
+per-file trimming is deliberately not offered.
 
 Neither is a data-integrity defect: retention, hashing and the completion gate all
 behaved correctly on the same run (985 superseded files were kept, not pruned;

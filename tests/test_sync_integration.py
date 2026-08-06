@@ -24,7 +24,6 @@ def _run(client: FakeGenomeSync, *arguments: str) -> subprocess.CompletedProcess
 
 def _setup(
     client: FakeGenomeSync,
-    omit: str,
     *extra_arguments: str,
     destination: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -35,8 +34,6 @@ def _setup(
         destination if destination is not None else str(client.destination),
         "--only",
         "lab",
-        "--omit-large",
-        omit,
         "--yes",
         *extra_arguments,
         client.donor,
@@ -140,10 +137,52 @@ def test_v2_config_preserves_saved_section_choices(
     assert completed.returncode == 0, completed.stderr + completed.stdout
     assert f"destination={client.destination}" in completed.stdout
     assert f"default_selection={expected}" in completed.stdout
-    assert "omitted_large_paths=[]" in completed.stdout
 
 
-def test_interactive_setup_and_sync_prefill_saved_choices(
+def test_v3_config_with_retired_selection_key_still_loads_and_syncs(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    # Every donor who ran `setup` before the payload picker was removed holds a v3
+    # file carrying its key. Refusing that file would be the regression.
+    client = fake_genome_sync
+    client.destination.mkdir()
+    client.config_file.parent.mkdir(parents=True)
+    client.config_file.write_text(
+        json.dumps(
+            {
+                "schema_version": "genome-sync-config/v3",
+                "donor": client.donor,
+                "destination": str(client.destination),
+                "only": "lab",
+                "exclude": "",
+                "omitted_large_paths": ["shortread/lab/payload-1.bin"],
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    os.chmod(client.config_file, 0o600)
+
+    status = _run(client, "status")
+    assert status.returncode == 0, status.stderr + status.stdout
+    assert "default_selection=lab" in status.stdout
+
+    completed = _run(client, "sync", "--yes")
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    # The previously omitted payload is no longer omittable, so it lands.
+    landed = client.destination / "shortread" / "lab" / "payload-1.bin"
+    assert landed.read_bytes() == client.payloads["shortread/lab/payload-1.bin"]
+    manifest = _manifest(client)
+    assert manifest["materialization"]["complete"] is True
+    assert manifest["omitted_files"] == {}
+
+    rewritten = json.loads(client.config_file.read_text())
+    assert rewritten["schema_version"] == "genome-sync-config/v4"
+    assert "omitted_large_paths" not in rewritten
+    assert rewritten["only"] == "lab"
+
+
+def test_interactive_setup_and_sync_ask_only_for_sections(
     fake_genome_sync: FakeGenomeSync,
 ) -> None:
     client = fake_genome_sync
@@ -156,22 +195,22 @@ def test_interactive_setup_and_sync_prefill_saved_choices(
     )
     setup.expect("Sync results, lab, or both?.*\\[results\\]")
     setup.sendline("lab")
-    setup.expect("Largest optional payloads:")
-    setup.expect("Numbers to omit.*\\[none\\]")
-    setup.sendline("1,3")
     setup.expect("Apply this verified update?.*\\[Y/n\\]")
+    # The section question is the only selection question left: no payload list,
+    # no numbered choices, no omit prompt between it and the confirmation.
+    assert "optional payloads" not in setup.before
+    assert "Numbers to omit" not in setup.before
     setup.sendline("y")
     setup.expect(pexpect.EOF)
     setup.close()
     assert setup.exitstatus == 0
 
     config = json.loads(client.config_file.read_text())
+    assert config["schema_version"] == "genome-sync-config/v4"
     assert config["only"] == "lab"
     assert config["destination"] == str(client.destination)
-    assert config["omitted_large_paths"] == [
-        "shortread/lab/payload-1.bin",
-        "shortread/lab/payload-3.bin",
-    ]
+    assert "omitted_large_paths" not in config
+    assert _manifest(client)["materialization"]["complete"] is True
 
     sync = pexpect.spawn(
         str(client.command),
@@ -182,12 +221,9 @@ def test_interactive_setup_and_sync_prefill_saved_choices(
     )
     sync.expect("What should be synced?.*\\[lab only\\]")
     sync.sendline("")
-    sync.expect("Largest optional payloads:")
-    sync.expect("Numbers to omit.*\\[1,3\\]")
-    assert "[omit]" in sync.before
-    assert "payload-1.bin" in sync.before
-    sync.sendline("")
     sync.expect("Apply this verified update?.*\\[Y/n\\]")
+    assert "optional payloads" not in sync.before
+    assert "Numbers to omit" not in sync.before
     sync.sendline("n")
     sync.expect("No files changed")
     sync.expect(pexpect.EOF)
@@ -195,60 +231,83 @@ def test_interactive_setup_and_sync_prefill_saved_choices(
     assert sync.exitstatus == 0
 
 
-def test_omitted_payload_can_be_added_later(fake_genome_sync: FakeGenomeSync) -> None:
+def test_one_off_run_asks_which_sections_to_sync(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    # A one-off run has no saved configuration. Before this it fell through to
+    # "results and lab" and printed that as a fact, committing the donor to both
+    # classes — on a real donor, 17.5 GB they were never asked about.
     client = fake_genome_sync
-    _setup(client, "1")
-    largest = client.destination / "shortread" / "lab" / "payload-1.bin"
-    assert not largest.exists()
-    partial = _manifest(client)
-    assert partial["materialization"]["complete"] is False
-    assert "shortread/lab/payload-1.bin" in partial["omitted_files"]
-    assert "shortread/lab/payload-1.bin" not in partial["files"]
-    assert partial["materialization"]["verified_remote_file_count"] == len(partial["files"]) + len(
-        partial["omitted_files"]
+    one_off = pexpect.spawn(
+        str(client.command),
+        ["--dest", str(client.destination), client.donor],
+        env=client.environment,
+        encoding="utf-8",
+        timeout=15,
     )
-    assert "shortread/lab/lab_manifest.json" in partial["files"]
-    assert "shortread/lab/_COMPLETE.json" in partial["files"]
-    outside_current_inventory = "longread/results/huge.cram"
-    config = json.loads(client.config_file.read_text())
-    config["omitted_large_paths"].append(outside_current_inventory)
-    config["omitted_large_paths"].sort()
-    client.config_file.write_text(json.dumps(config, sort_keys=True) + "\n")
-    os.chmod(client.config_file, 0o600)
+    one_off.expect("What should be synced?.*\\[both\\]")
+    one_off.sendline("lab")
+    one_off.expect("Selection:.*lab only")
+    one_off.expect("Apply this verified update?.*\\[Y/n\\]")
+    one_off.sendline("y")
+    one_off.expect(pexpect.EOF)
+    one_off.close()
+    assert one_off.exitstatus == 0
 
-    completed = _run(client, "sync", "--omit-large", "none", "--yes")
-    assert completed.returncode == 0, completed.stderr + completed.stdout
-    assert largest.read_bytes() == client.payloads["shortread/lab/payload-1.bin"]
-    complete = _manifest(client)
-    assert complete["materialization"]["complete"] is True
-    assert complete["omitted_files"] == {}
-    config = json.loads(client.config_file.read_text())
-    assert config["omitted_large_paths"] == [outside_current_inventory]
+    for relative, content in client.payloads.items():
+        assert (client.destination / relative).read_bytes() == content, relative
+    assert _manifest(client)["materialization"]["complete"] is True
+    # A one-off saves nothing: no config, no stored credential.
+    assert not client.config_file.exists()
 
 
-def test_deselecting_downloaded_payload_never_deletes_it(
+def test_one_off_honours_an_explicit_section_without_asking(
     fake_genome_sync: FakeGenomeSync,
 ) -> None:
     client = fake_genome_sync
-    _setup(client, "none")
-    largest = client.destination / "shortread" / "lab" / "payload-1.bin"
-    original = largest.read_bytes()
+    one_off = pexpect.spawn(
+        str(client.command),
+        ["--dest", str(client.destination), "--only", "lab", "--yes", client.donor],
+        env=client.environment,
+        encoding="utf-8",
+        timeout=15,
+    )
+    one_off.expect(pexpect.EOF)
+    one_off.close()
+    assert one_off.exitstatus == 0
+    assert "What should be synced?" not in one_off.before
 
-    completed = _run(client, "sync", "--omit-large", "1", "--yes")
+
+def test_destination_command_rewrites_the_config_without_syncing(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _setup(client)
+    moved = client.destination.parent / "genome-moved"
+    moved.mkdir()
+
+    completed = _run(client, "destination", str(moved))
     assert completed.returncode == 0, completed.stderr + completed.stdout
-    assert largest.read_bytes() == original
-    assert "to remove" not in completed.stdout
-    partial = _manifest(client)
-    assert partial["materialization"]["complete"] is False
-    assert "shortread/lab/payload-1.bin" in partial["omitted_files"]
-    assert "shortread/lab/payload-1.bin" not in partial["files"]
+    assert "No files were moved" in completed.stdout
+    updated = json.loads(client.config_file.read_text())
+    assert updated["schema_version"] == "genome-sync-config/v4"
+    assert updated["destination"] == str(moved)
+    assert updated["only"] == "lab"
+    assert not any(moved.iterdir())
+
+
+def test_omit_large_is_no_longer_an_option(fake_genome_sync: FakeGenomeSync) -> None:
+    client = fake_genome_sync
+    completed = _run(client, "sync", "--omit-large", "1", "--yes")
+    assert completed.returncode == 1
+    assert "unknown option: --omit-large" in completed.stderr
 
 
 def test_repeated_setup_prefills_and_commits_only_after_confirmation(
     fake_genome_sync: FakeGenomeSync,
 ) -> None:
     client = fake_genome_sync
-    _setup(client, "1")
+    _setup(client)
     original_config = client.config_file.read_bytes()
 
     repeated = pexpect.spawn(
@@ -262,9 +321,6 @@ def test_repeated_setup_prefills_and_commits_only_after_confirmation(
     repeated.sendline("")
     repeated.expect("Save your genome data where?.*" + re.escape(str(client.destination)))
     repeated.sendline("")
-    repeated.expect("Largest optional payloads:")
-    repeated.expect("Numbers to omit.*\\[1\\]")
-    repeated.sendline("none")
     repeated.expect("Apply this verified update?.*\\[Y/n\\]")
     repeated.sendline("n")
     repeated.expect("No files changed")
@@ -273,25 +329,28 @@ def test_repeated_setup_prefills_and_commits_only_after_confirmation(
     assert repeated.exitstatus == 0
     assert client.config_file.read_bytes() == original_config
 
-    completed = _run(client, "setup", "--omit-large", "none", "--yes", client.donor)
+    completed = _run(client, "setup", "--yes", client.donor)
     assert completed.returncode == 0, completed.stderr + completed.stdout
     updated = json.loads(client.config_file.read_text())
+    assert updated["schema_version"] == "genome-sync-config/v4"
     assert updated["destination"] == str(client.destination)
     assert updated["only"] == "lab"
-    assert updated["omitted_large_paths"] == []
 
 
 def test_repeated_setup_failure_preserves_saved_configuration(
     fake_genome_sync: FakeGenomeSync,
 ) -> None:
     client = fake_genome_sync
-    _setup(client, "1")
+    _setup(client)
     original_config = client.config_file.read_bytes()
+    # Corrupt a landed payload so the next run must re-download exactly it.
+    corrupted = client.destination / "shortread" / "lab" / "payload-1.bin"
+    corrupted.write_bytes(b"X" * len(client.payloads["shortread/lab/payload-1.bin"]))
     failing_environment = dict(client.environment)
     failing_environment["FAKE_B2_FAIL_DOWNLOAD_SUFFIX"] = "payload-1.bin"
 
     completed = subprocess.run(
-        [client.command, "setup", "--omit-large", "none", "--yes", client.donor],
+        [client.command, "setup", "--yes", client.donor],
         env=failing_environment,
         text=True,
         capture_output=True,
@@ -306,7 +365,7 @@ def test_lab_only_sync_audits_carried_results_and_normalizes_active_record(
     fake_genome_sync: FakeGenomeSync,
 ) -> None:
     client = fake_genome_sync
-    _setup(client, "none")
+    _setup(client)
     contents = _seed_legacy_result_records(client)
     corrupt_relative = "shortread/results/corrupt-result.bin"
     missing_relative = "shortread/results/missing-result.bin"
@@ -314,7 +373,7 @@ def test_lab_only_sync_audits_carried_results_and_normalizes_active_record(
     (client.destination / corrupt_relative).write_bytes(b"X" * len(contents[corrupt_relative]))
     (client.destination / missing_relative).unlink()
 
-    completed = _run(client, "sync", "--omit-large", "none", "--yes")
+    completed = _run(client, "sync", "--yes")
     assert completed.returncode == 0, completed.stderr + completed.stdout
     manifest = _manifest(client)
     assert manifest["schema"] == 5
@@ -352,11 +411,11 @@ def test_absent_remote_file_is_retained_by_default(
     fake_genome_sync: FakeGenomeSync,
 ) -> None:
     client = fake_genome_sync
-    _setup(client, "none")
+    _setup(client)
     _seed_absent_remote_lab_file(client, RETIRED_RELATIVE, RETIRED_CONTENT)
     retired_path = client.destination / RETIRED_RELATIVE
 
-    completed = _run(client, "sync", "--omit-large", "none", "--yes")
+    completed = _run(client, "sync", "--yes")
     assert completed.returncode == 0, completed.stderr + completed.stdout
     assert "1 kept (no longer in the active snapshot)" in completed.stdout
     assert "to remove" not in completed.stdout
@@ -375,7 +434,7 @@ def test_absent_remote_file_is_retained_by_default(
     assert manifest["materialization"]["retained_bytes"] == len(RETIRED_CONTENT)
     assert manifest["materialization"]["complete"] is True
 
-    repeated = _run(client, "sync", "--omit-large", "none", "--yes")
+    repeated = _run(client, "sync", "--yes")
     assert repeated.returncode == 0, repeated.stderr + repeated.stdout
     assert retired_path.read_bytes() == RETIRED_CONTENT
     assert RETIRED_RELATIVE in _manifest(client)["retained_files"]
@@ -385,11 +444,11 @@ def test_prune_removes_file_absent_from_active_snapshot(
     fake_genome_sync: FakeGenomeSync,
 ) -> None:
     client = fake_genome_sync
-    _setup(client, "none")
+    _setup(client)
     _seed_absent_remote_lab_file(client, RETIRED_RELATIVE, RETIRED_CONTENT)
     retired_path = client.destination / RETIRED_RELATIVE
 
-    completed = _run(client, "sync", "--omit-large", "none", "--prune", "--yes")
+    completed = _run(client, "sync", "--prune", "--yes")
     assert completed.returncode == 0, completed.stderr + completed.stdout
     assert "1 to remove" in completed.stdout
     assert "kept (no longer in the active snapshot)" not in completed.stdout
@@ -407,13 +466,13 @@ def test_corrupt_retained_file_is_reported_unavailable(
     fake_genome_sync: FakeGenomeSync,
 ) -> None:
     client = fake_genome_sync
-    _setup(client, "none")
+    _setup(client)
     _seed_absent_remote_lab_file(client, RETIRED_RELATIVE, RETIRED_CONTENT)
     retired_path = client.destination / RETIRED_RELATIVE
     corrupted = b"X" * len(RETIRED_CONTENT)
     retired_path.write_bytes(corrupted)
 
-    completed = _run(client, "sync", "--omit-large", "none", "--yes")
+    completed = _run(client, "sync", "--yes")
     assert completed.returncode == 0, completed.stderr + completed.stdout
     assert retired_path.read_bytes() == corrupted
 
@@ -433,7 +492,7 @@ def test_jobs_four_downloads_every_object_with_correct_bytes(
     fake_genome_sync: FakeGenomeSync,
 ) -> None:
     client = fake_genome_sync
-    _setup(client, "none", "--jobs", "4")
+    _setup(client, "--jobs", "4")
 
     for relative, content in client.payloads.items():
         landed = client.destination / relative
@@ -454,15 +513,11 @@ def test_jobs_one_and_four_produce_identical_file_records(
     serial_destination = client.destination.parent / "genome-serial"
     parallel_destination = client.destination.parent / "genome-parallel"
 
-    _setup(client, "none", "--jobs", "1", destination=str(serial_destination))
-    _setup(client, "none", "--jobs", "4", destination=str(parallel_destination))
+    _setup(client, "--jobs", "1", destination=str(serial_destination))
+    _setup(client, "--jobs", "4", destination=str(parallel_destination))
 
-    serial_manifest = json.loads(
-        (serial_destination / ".genome-manifest.json").read_text()
-    )
-    parallel_manifest = json.loads(
-        (parallel_destination / ".genome-manifest.json").read_text()
-    )
+    serial_manifest = json.loads((serial_destination / ".genome-manifest.json").read_text())
+    parallel_manifest = json.loads((parallel_destination / ".genome-manifest.json").read_text())
     assert serial_manifest["files"], "expected downloaded file records"
     assert serial_manifest["files"] == parallel_manifest["files"]
 
@@ -473,7 +528,7 @@ def test_jobs_four_mid_run_fetch_failure_fails_closed(
     client = fake_genome_sync
     # A completed snapshot, then corrupt several payloads so a re-sync must
     # re-download them concurrently under --jobs 4.
-    _setup(client, "none", "--jobs", "4")
+    _setup(client, "--jobs", "4")
     preexisting = b"PRE-EXISTING-LOCAL-BYTES-DO-NOT-REPLACE"
     survivor_relative = "shortread/lab/payload-4.bin"
     for relative in (
@@ -486,7 +541,7 @@ def test_jobs_four_mid_run_fetch_failure_fails_closed(
     failing_environment = dict(client.environment)
     failing_environment["FAKE_B2_FAIL_DOWNLOAD_SUFFIX"] = "payload-4.bin"
     completed = subprocess.run(
-        [client.command, "sync", "--omit-large", "none", "--yes", "--jobs", "4"],
+        [client.command, "sync", "--yes", "--jobs", "4"],
         env=failing_environment,
         text=True,
         capture_output=True,
@@ -494,9 +549,9 @@ def test_jobs_four_mid_run_fetch_failure_fails_closed(
     )
 
     assert completed.returncode != 0
-    assert (
-        "Download failed on shortread/lab/payload-4.bin" in completed.stdout
-    ), completed.stdout + completed.stderr
+    assert "Download failed on shortread/lab/payload-4.bin" in completed.stdout, (
+        completed.stdout + completed.stderr
+    )
     # The failed object's pre-existing on-disk copy was never atomically replaced.
     assert (client.destination / survivor_relative).read_bytes() == preexisting
 
@@ -507,6 +562,6 @@ def test_jobs_rejects_out_of_range_or_non_numeric(
     bad_jobs: str,
 ) -> None:
     client = fake_genome_sync
-    completed = _run(client, "sync", "--jobs", bad_jobs, "--omit-large", "none", "--yes")
+    completed = _run(client, "sync", "--jobs", bad_jobs, "--yes")
     assert completed.returncode != 0
     assert "--jobs must be" in completed.stderr, completed.stderr + completed.stdout

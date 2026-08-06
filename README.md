@@ -58,30 +58,28 @@ genome-sync
 genome-sync status
 ```
 
-Setup preserves the existing destination and `results`, `lab`, or `both`
-preference. Every later interactive sync displays those saved choices. After
-the remote activation records and manifests have been validated, it also shows
-the five largest optional payloads. The prompt accepts comma-separated numbers
-to omit; pressing Enter keeps the previous omission set, and `none` includes
-everything.
+Which sections to sync — `results`, `lab`, or `both` — is the only selection.
+Setup asks it and remembers the answer alongside the destination; every later
+interactive sync shows that saved answer and accepts a one-run override. The
+one-off form asks the same question, defaulting to `both`, so a run that was
+never configured still states what it is about to download rather than assuming
+it. Automation passes `--only` / `--exclude`, or `--yes` to take the saved
+answer unprompted.
 
-Automation can make the same choice explicitly:
+The selected sections are downloaded whole. There is no per-file picking: a
+donor either has a section or does not.
 
 ```bash
-genome-sync sync --omit-large 1,3 --yes
-genome-sync sync --omit-large none --yes
+genome-sync sync --only results --yes
+genome-sync --dest ~/Genome/donor-id donor-id      # asks results / lab / both
 ```
 
-An omitted payload can be added on any later run. Deselecting one never removes
-an already downloaded copy. `.genome-manifest.json` schema 5 separates the
-validated remote activation from local materialization through
-`materialization`, `omitted_files`, `unavailable_files`, `retained_files`, and
-per-assay `local_materialization_complete` fields. Omitted payloads are not
-included in the manifest's `files` map. Files carried from a section outside the
-current sync are rehashed before being carried forward; missing or corrupt files
-move to `unavailable_files` and force materialization incomplete. Activation
-markers and remote manifests are control files: they remain mandatory and cannot
-be deselected.
+`.genome-manifest.json` schema 5 separates the validated remote activation from
+local materialization through `materialization`, `unavailable_files`,
+`retained_files`, and per-assay `local_materialization_complete` fields. Files
+carried from a section outside the current sync are rehashed before being
+carried forward; missing or corrupt files move to `unavailable_files` and force
+materialization incomplete.
 
 Retention is the default. A previously managed file that the new active snapshot
 no longer names stays on disk and moves to `retained_files` — recorded apart from
@@ -129,8 +127,8 @@ uv run pytest
 ```
 
 The integration suite uses a deterministic local B2 double. It covers saved
-choices, partial-manifest honesty, adding an omitted payload later, the
-no-delete-on-deselect invariant, retention-by-default (kept across repeated
+choices, the section question on both the configured and one-off paths, reading
+a pre-v4 config, retention-by-default (kept across repeated
 syncs, removed only under `--prune`, corrupt leftovers disclosed as unavailable),
 and concurrent downloads (`--jobs 4` lands every object with correct bytes,
 `--jobs 4` and `--jobs 1` produce identical manifest records, a mid-run fetch
