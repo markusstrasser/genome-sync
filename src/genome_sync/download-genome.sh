@@ -2366,13 +2366,24 @@ prefetch_fetch_one() {
     return
   fi
   chmod 600 "$prefetch_temp"
-  if "${B2_RUN[@]}" file download --no-progress \
-      --max-download-streams-per-file "$MAX_STREAMS_PER_FILE" \
-      "b2://${BUCKET}/${prefetch_key}" "$prefetch_temp" > "$prefetch_log" 2>&1; then
+  # The download runs as a background child so this worker can kill it on TERM.
+  # Killing the worker subshell alone is not enough: b2 is reparented and keeps
+  # running, which leaks a download process past genome-sync's own termination.
+  local prefetch_download_pid=""
+  trap 'if [ -n "$prefetch_download_pid" ]; then kill -TERM "$prefetch_download_pid" 2>/dev/null; fi; exit 143' HUP INT TERM
+  "${B2_RUN[@]}" file download --no-progress \
+    --max-download-streams-per-file "$MAX_STREAMS_PER_FILE" \
+    "b2://${BUCKET}/${prefetch_key}" "$prefetch_temp" > "$prefetch_log" 2>&1 &
+  prefetch_download_pid=$!
+  # Recorded too, so the parent's teardown can reach the child directly even if
+  # this worker never gets to run its trap.
+  printf '%s\n' "$prefetch_download_pid" >> "$PREFETCH_PIDS"
+  if wait "$prefetch_download_pid"; then
     printf 'OK\t%s\n' "$prefetch_temp" > "$prefetch_status_partial"
   else
     printf 'FAIL\t%s\n' "$prefetch_temp" > "$prefetch_status_partial"
   fi
+  trap - HUP INT TERM
   # The rename is the ready signal: the consumer only ever sees a complete status.
   mv -f "$prefetch_status_partial" "$prefetch_status_final"
 }
