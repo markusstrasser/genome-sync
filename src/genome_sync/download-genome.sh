@@ -36,7 +36,7 @@ OPTIONS:
       --only WHICH     sync only one of: lab | results | ensemble
       --exclude WHICH  skip one of: lab | results | ensemble
       --prune          delete previously managed files that are absent from the
-                       new active snapshot (default: keep them)
+                       new active snapshot (default: keep them under _retained/)
       --jobs N         download up to N objects concurrently (default: 4,
                        range 1..16); verification and installation stay serial.
                        --jobs 1 is the fully serial path.
@@ -53,6 +53,7 @@ LOCAL LAYOUT:
   AGENTS.md / CLAUDE.md              verified root brief for frontier agents
   <sample>/lab/                      current verified raw/lab files
   <sample>/results/                  current verified result files
+  _retained/                         kept files no longer in the active snapshot
   .genome-manifest.json              active plan map and verified local hashes
 
 Only stable lab and donor-results-completion/v3 views are eligible. The
@@ -68,9 +69,12 @@ SETUP AND UPDATES:
   whole. Noninteractive callers pass --only or --exclude.
   Downloads are differential.
   Retention is the default: a previously managed file that is absent from the
-  new active snapshot stays on disk and moves to the manifest's `retained_files`
-  map instead of `files`. Deleting those files is a separate explicit choice —
-  pass --prune when you want them removed.
+  new active snapshot keeps its bytes but is moved to `_retained/` and recorded
+  in the manifest's `retained_files` map instead of `files`, so the live tree
+  always mirrors the active snapshot exactly. Deleting retained files is a
+  separate explicit choice — pass --prune when you want them removed. A later
+  snapshot that re-adds a retained file restores it from `_retained/` without
+  re-downloading.
   `genome-sync destination <directory>` changes only the saved destination. It
   uses the existing Keychain/Credential Locker entry and never moves or syncs
   files; the directory must already exist.
@@ -778,6 +782,36 @@ elif operation == "remove":
         os.fsync(parent_fd)
     finally:
         os.close(parent_fd)
+elif operation == "move":
+    # Same-filesystem rename of one managed regular file to another managed
+    # path (retention attic). Never copies: a move either fully lands or the
+    # source is untouched, so retained bytes cannot be half-transferred.
+    source_relative, target_relative = arguments
+    source_parent_fd, source_name = open_parent(source_relative)
+    try:
+        observed = os.stat(source_name, dir_fd=source_parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(observed.st_mode):
+            fail(f"move source is not regular: {source_relative}")
+        target_parent_fd, target_name = open_parent(target_relative, create=True)
+        try:
+            try:
+                target_stat = os.stat(target_name, dir_fd=target_parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                target_stat = None
+            if target_stat is not None and not stat.S_ISREG(target_stat.st_mode):
+                fail(f"move target is not regular: {target_relative}")
+            os.rename(
+                source_name,
+                target_name,
+                src_dir_fd=source_parent_fd,
+                dst_dir_fd=target_parent_fd,
+            )
+            os.fsync(target_parent_fd)
+            os.fsync(source_parent_fd)
+        finally:
+            os.close(target_parent_fd)
+    finally:
+        os.close(source_parent_fd)
 elif operation == "prune-empty-parents":
     relative = PurePosixPath(*validate_relative(arguments[0]))
     parent_parts = relative.parts[:-1]
@@ -934,7 +968,7 @@ VERIFIED="$CONTROL_DIR/verified.tsv"
 FILTERED="$CONTROL_DIR/filtered.tsv"
 # Nothing is selectable any more, so this partition file stays empty. It is still
 # written and read: the manifest's `omitted_files` field and its partition
-# invariant are part of schema 5, which donors already hold.
+# invariant carried over from schema 5 into schema 6, which donors already hold.
 OMITTED="$CONTROL_DIR/omitted.tsv"
 TODO="$CONTROL_DIR/todo.tsv"
 PRUNES="$CONTROL_DIR/prunes.txt"
@@ -1101,6 +1135,10 @@ def canonical_relative(value):
     parsed = PurePosixPath(value)
     if parsed.is_absolute() or parsed.as_posix() != value or any(part in {"", ".", ".."} for part in parsed.parts):
         raise SystemExit(f"noncanonical B2 key suffix: {value!r}")
+    if parsed.parts[0] == "_retained":
+        # `_retained/` is the client-owned retention attic; a remote snapshot
+        # must never be able to write into or shadow that namespace.
+        raise SystemExit(f"remote path collides with the local retention attic: {value!r}")
     return value
 
 def canonical_segment(value, *, field):
@@ -2113,12 +2151,17 @@ if [ -n "$existing_donor" ]; then
   done < "$LOCAL_INDEX"
 fi
 prune_n=$(wc -l < "$PRUNES" | tr -d ' ')
+# Entries not yet under the retention attic get MOVED there on a keep run; entries
+# already under `_retained/` only need reporting (or deletion under --prune).
+move_n=$(grep -cv '^_retained/' "$PRUNES" || true)
+attic_n=$((prune_n - move_n))
 absent_summary=""
 if [ "$prune_n" -gt 0 ]; then
   if [ "$PRUNE" -eq 1 ]; then
     absent_summary=" · ${R}${prune_n} to remove${X}"
   else
-    absent_summary=" · ${D}${prune_n} kept (no longer in the active snapshot)${X}"
+    [ "$move_n" -gt 0 ] && absent_summary=" · ${Y}${move_n} to retire to _retained/${X}"
+    [ "$attic_n" -gt 0 ] && absent_summary="${absent_summary} · ${D}${attic_n} in _retained/${X}"
   fi
 fi
 
@@ -2145,7 +2188,7 @@ if [ "$DRYRUN" -eq 1 ]; then
     if [ "$PRUNE" -eq 1 ]; then
       say "\n  ${D}would remove ${prune_n} previously managed file(s):${X}"
     else
-      say "\n  ${D}would keep ${prune_n} previously managed file(s) no longer in the active snapshot:${X}"
+      say "\n  ${D}would retire ${move_n} file(s) no longer in the active snapshot to _retained/ (${attic_n} already there):${X}"
     fi
     awk -v limit=25 '
       { if (NR <= limit) print "    " $0 }
@@ -2162,7 +2205,7 @@ if [ "$DRYRUN" -eq 1 ]; then
 fi
 
 confirmation_required=0
-if [ -s "$TODO" ] || { [ "$PRUNE" -eq 1 ] && [ "$prune_n" -gt 0 ]; }; then
+if [ -s "$TODO" ] || [ "$move_n" -gt 0 ] || { [ "$PRUNE" -eq 1 ] && [ "$prune_n" -gt 0 ]; }; then
   confirmation_required=1
 elif { [ "$COMMAND" = "setup" ] || [ "$COMMAND" = "sync" ]; } \
   && [ "$ASSUME_YES" -eq 0 ] && [ "$FILTER_EXPLICIT" -eq 0 ] \
@@ -2424,8 +2467,8 @@ from pathlib import Path
 
 manifest_path, guide_root = sys.argv[1:]
 manifest = json.load(open(manifest_path, encoding="utf-8"))
-if not isinstance(manifest, dict) or manifest.get("schema") != 5:
-    raise SystemExit("finalized local manifest must use schema 5")
+if not isinstance(manifest, dict) or manifest.get("schema") != 6:
+    raise SystemExit("finalized local manifest must use schema 6")
 active = manifest.get("active_results")
 files = manifest.get("files")
 omitted = manifest.get("omitted_files")
@@ -2435,6 +2478,42 @@ if not all(
     isinstance(value, dict) for value in (active, files, omitted, unavailable, retained)
 ):
     raise SystemExit("finalized local manifest materialization maps are malformed")
+guide_root_path = Path(guide_root)
+
+# The attic README rides with any sync that leaves retained bytes behind — even
+# a lab-only sync with no active results section, which skips the other guides.
+retained_flagged_unavailable = {
+    relative: record
+    for relative, record in unavailable.items()
+    if record.get("retained") is True
+}
+if retained or retained_flagged_unavailable:
+    attic_lines = [
+        "# Retention attic — NOT part of the active snapshot",
+        "",
+        "Files in this directory were part of an earlier verified snapshot and are",
+        "no longer named by the active one. `genome-sync` keeps their bytes instead",
+        "of deleting them (deletion is only ever the explicit `--prune` flag), but",
+        "they are **outside the current activation**: never cite them as activated",
+        "evidence, and never prefer them over a file of the same name in the live",
+        "tree. The live tree (everything outside `_retained/`) is exactly the",
+        "active snapshot.",
+        "",
+        "The authoritative inventory is `../.genome-manifest.json` → `retained_files`",
+        "(each record carries `original_path`). Run `genome-sync --prune` to delete",
+        "everything here; a later snapshot that re-adds a file restores it to the",
+        "live tree automatically from these bytes.",
+        "",
+        "## Contents",
+        "",
+    ]
+    for relative, record in sorted({**retained, **retained_flagged_unavailable}.items()):
+        original = record.get("original_path", relative)
+        attic_lines.append(f"- `{relative}` — dropped from `{original}`")
+    attic_root = guide_root_path / "_retained"
+    attic_root.mkdir(parents=True, exist_ok=False)
+    (attic_root / "README.md").write_text("\n".join(attic_lines) + "\n", encoding="utf-8")
+
 if not active:
     raise SystemExit(0)
 root_lines = [
@@ -2443,7 +2522,7 @@ root_lines = [
     "This index is generated from `.genome-manifest.json`. Its `active_results`",
     "map binds the verified remote activation for each assay. The manifest's",
     "`materialization`, `omitted_files`, and `unavailable_files` fields say which activated bytes are local.",
-    "`retained_files` lists kept files that the active snapshot no longer names; they are not activated bytes.",
+    "`retained_files` lists kept files that the active snapshot no longer names; they live under `_retained/` and are not activated bytes.",
     "",
     "| Assay | Sample | Updated | Local | Results plan | Results index |",
     "|---|---|---|---|---|---|",
@@ -2455,7 +2534,6 @@ lab_assays = {
     if "/lab/" in relative
 }
 
-guide_root_path = Path(guide_root)
 for assay, record in sorted(active.items()):
     if not isinstance(record, dict):
         raise SystemExit(f"active result record is malformed for assay {assay}")
@@ -2541,7 +2619,7 @@ for assay, record in sorted(active.items()):
         "",
         "Read `../.genome-manifest.json` first. Its `active_results` entry identifies the exact plan and local results path. Then read `results/AGENTS.md` for the evidence and interpretation contract and `results/TOC.md` to locate stages.",
         "The remote activation and the local materialization are separate facts. Check `materialization.complete`, `omitted_files`, and `unavailable_files` before claiming a payload is local.",
-        "Files in `retained_files` are kept local bytes from an earlier snapshot; they are outside the current activation, so never cite them as activated evidence. `unavailable_files` entries flagged `retained` describe those leftovers too, and are excluded from every `materialization` count.",
+        "Files under `_retained/` (manifest `retained_files`) are kept local bytes from an earlier snapshot; they are outside the current activation, so never cite them as activated evidence. Everything outside `_retained/` is exactly the active snapshot. `unavailable_files` entries flagged `retained` describe those leftovers too, and are excluded from every `materialization` count.",
         "",
         "Treat `lab/` as sequencing evidence, not interpretation. Validate `lab/lab_manifest.json` and `lab/_COMPLETE.json` before relying on it. Never upload donor-specific sequence, variants, genotypes, or findings to a network service without explicit informed permission.",
         "",
@@ -2555,9 +2633,9 @@ for assay, record in sorted(active.items()):
 
 (guide_root_path / "TOC.md").write_text("\n".join(root_lines) + "\n", encoding="utf-8")
 PYEOF
-  [ -f "$guide_root/TOC.md" ] || return 0
+  [ -f "$guide_root/TOC.md" ] || [ -f "$guide_root/_retained/README.md" ] || return 0
   chmod -R go-rwx "$guide_root"
-  fs_guard install "TOC.md" "$guide_root/TOC.md" || exit 1
+  [ -f "$guide_root/TOC.md" ] && { fs_guard install "TOC.md" "$guide_root/TOC.md" || exit 1; }
   while IFS= read -r guide_path; do
     relative_guide="${guide_path#"$guide_root/"}"
     fs_guard install "$relative_guide" "$guide_path" || exit 1
@@ -2573,14 +2651,37 @@ if [ "$prune_n" -gt 0 ] && [ "$PRUNE" -eq 1 ]; then
     fs_guard prune-empty-parents "$relative" || exit 1
     log_event "file remove path=${relative}"
   done < "$PRUNES"
+  # The attic README is client-owned, not managed; drop it once the attic empties
+  # so an empty `_retained/` directory does not linger behind a full prune.
+  if [ -f "$DEST_ABS/_retained/README.md" ]; then
+    fs_guard remove "_retained/README.md" || exit 1
+    fs_guard prune-empty-parents "_retained/README.md" || exit 1
+  fi
 elif [ "$prune_n" -gt 0 ]; then
-  say "\n  ${D}Keeping ${prune_n} file(s) no longer in the active snapshot:${X}"
+  # Retention keeps the bytes but takes them out of the live tree: everything
+  # under the destination outside `_retained/` is exactly the active snapshot,
+  # so a later reader never mistakes a dropped file for activated evidence.
+  if [ "$move_n" -gt 0 ]; then
+    say "\n  ${Y}Retiring ${move_n} file(s) no longer in the active snapshot to _retained/:${X}"
+  else
+    say "\n  ${D}${attic_n} file(s) from earlier snapshots remain in _retained/:${X}"
+  fi
   while IFS= read -r relative; do
     [ -n "$relative" ] || continue
-    say "    ${D}·${X} ${relative}"
-    log_event "file retain path=${relative}"
+    case "$relative" in
+      _retained/*)
+        say "    ${D}·${X} ${relative}"
+        log_event "file retain path=${relative}"
+        ;;
+      *)
+        say "    ${Y}→${X} ${relative} ${D}→ _retained/${relative}${X}"
+        fs_guard move "$relative" "_retained/${relative}" || exit 1
+        fs_guard prune-empty-parents "$relative" || exit 1
+        log_event "file retire path=${relative} attic=_retained/${relative}"
+        ;;
+    esac
   done < "$PRUNES"
-  say "    ${D}(pass --prune to delete them instead)${X}"
+  say "    ${D}(retained bytes are outside the active snapshot; pass --prune to delete them)${X}"
 fi
 
 fs_guard validate-tree || exit 1
@@ -2813,29 +2914,71 @@ for relative, record in sorted(carried_candidates.items()):
 merged_files.update(observed)
 
 # Retention is the default. Previously managed bytes that the new active snapshot
-# no longer names stay on disk unless --prune was given, and they are recorded
-# apart from `files` so nothing reads them as part of that snapshot.
-retained_candidates = {
-    relative: record
-    for relative, record in existing_retained.items()
-    if section_of(relative) not in requested_sections
-}
+# no longer names stay on disk unless --prune was given — but OUT of the live
+# tree: the sync loop moved them under `_retained/`, so everything outside the
+# attic is exactly the active snapshot. Records are keyed by their attic path
+# (the on-disk location) and carry `original_path` for identity.
+ATTIC_PREFIX = "_retained/"
+
+def original_of(managed_key):
+    if managed_key.startswith(ATTIC_PREFIX):
+        return managed_key[len(ATTIC_PREFIX):]
+    return managed_key
+
+def audit_retained_file(original, record):
+    """Audit dropped bytes where they actually live and key the record there.
+    Normally that is the attic; a pre-attic manifest whose section was not part
+    of this sync still holds the bytes in place, and the record must keep saying
+    so until a sync of that section performs the move."""
+    attic_key = ATTIC_PREFIX + original
+    attic_disk = destination_root.joinpath(*canonical_managed_relative(attic_key).parts)
+    if attic_disk.exists():
+        return attic_key, *audit_carried_file(attic_key, record)
+    original_disk = destination_root.joinpath(*canonical_managed_relative(original).parts)
+    if original_disk.exists():
+        return original, *audit_carried_file(original, record)
+    return attic_key, *audit_carried_file(attic_key, record)
+
+# Keyed by ORIGINAL path so a legacy in-place record and an attic record of the
+# same dropped file collapse to one candidate. existing_files iterates last: on
+# a re-drop its record describes the bytes the move just placed in the attic.
+retained_candidates = {}
+for managed_key, record in existing_retained.items():
+    original = original_of(managed_key)
+    if section_of(original) not in requested_sections:
+        retained_candidates[original] = record
 if not prune_requested:
-    for previously_managed in (existing_files, existing_retained):
-        for relative, record in previously_managed.items():
-            if section_of(relative) not in requested_sections or relative in verified:
-                continue
-            retained_candidates[relative] = record
+    for managed_key, record in existing_retained.items():
+        original = original_of(managed_key)
+        if section_of(original) not in requested_sections:
+            continue
+        if managed_key == original and original in verified:
+            # Legacy in-place retained bytes that the snapshot re-adds serve as
+            # the active local file again; they never reach the attic.
+            continue
+        retained_candidates[original] = record
+    for relative, record in existing_files.items():
+        if section_of(relative) not in requested_sections or relative in verified:
+            continue
+        retained_candidates[relative] = record
 merged_retained = {}
 retained_unavailable = {}
-for relative, record in sorted(retained_candidates.items()):
-    if relative in merged_files:
-        raise SystemExit(f"retained path is also an active manifest path: {relative}")
-    carried, unavailable = audit_carried_file(relative, record)
+for original, record in sorted(retained_candidates.items()):
+    managed_key, carried, unavailable = audit_retained_file(original, record)
+    if managed_key in merged_files:
+        raise SystemExit(f"retained path is also an active manifest path: {managed_key}")
     if carried is not None:
-        merged_retained[relative] = {**carried, "reason": "absent_from_active_snapshot"}
+        merged_retained[managed_key] = {
+            **carried,
+            "reason": "absent_from_active_snapshot",
+            "original_path": original,
+        }
     else:
-        retained_unavailable[relative] = {**unavailable, "retained": True}
+        retained_unavailable[managed_key] = {
+            **unavailable,
+            "retained": True,
+            "original_path": original,
+        }
 
 existing_omitted = existing.get("omitted_files", {})
 if not isinstance(existing_omitted, dict) or any(
@@ -2864,6 +3007,17 @@ for index, (left_label, left_paths) in enumerate(manifest_partitions):
             raise SystemExit(
                 f"{left_label} and {right_label} manifest paths must be disjoint: {overlap[0]}"
             )
+# The attic namespace belongs exclusively to retention: active snapshot paths
+# must never appear under it, and a retained record may sit outside it only as
+# a not-yet-migrated legacy in-place record (its key then equals its original).
+for label, paths in manifest_partitions[:3]:
+    atticked = sorted(path for path in paths if path.startswith(ATTIC_PREFIX))
+    if atticked and label != "unavailable":
+        raise SystemExit(f"{label} manifest path invades the retention attic: {atticked[0]}")
+    if label == "unavailable":
+        for path in atticked:
+            if all_unavailable[path].get("retained") is not True:
+                raise SystemExit(f"active unavailable path invades the retention attic: {path}")
 
 if "results" in requested_sections:
     active_results = json.load(open(active_results_path, encoding="utf-8"))
@@ -2941,7 +3095,7 @@ for section in requested_sections:
     section_sync[section] = synced_at
 payload = {
     "tool": "download-genome.sh",
-    "schema": 5,
+    "schema": 6,
     "donor": donor,
     "bucket": bucket,
     "location": location,
@@ -2955,6 +3109,7 @@ payload = {
             for assay in sorted(active_results)
             for filename in ("AGENTS.md", "CLAUDE.md", "README.md", "TOC.md")
         ],
+        *(["_retained/README.md"] if merged_retained or retained_unavailable else []),
     ],
     "file_count": len(merged_files),
     "materialization": {

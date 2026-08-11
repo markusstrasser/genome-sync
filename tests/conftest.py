@@ -25,12 +25,20 @@ def _write_executable(path: Path, content: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def _write_lab_snapshot(remote_root: Path, donor: str) -> dict[str, bytes]:
+def _write_lab_snapshot(
+    remote_root: Path,
+    donor: str,
+    payloads: dict[str, bytes] | None = None,
+) -> dict[str, bytes]:
+    """Write (or rewrite) the fake remote lab snapshot for `payloads`, deriving
+    the lab manifest and completion marker from them, and dropping any remote
+    payload object the new snapshot no longer names."""
     assay = "shortread"
-    payloads = {
-        f"{assay}/lab/payload-{index}.bin": bytes([64 + index]) * size
-        for index, size in enumerate((60, 50, 40, 30, 20, 10), start=1)
-    }
+    if payloads is None:
+        payloads = {
+            f"{assay}/lab/payload-{index}.bin": bytes([64 + index]) * size
+            for index, size in enumerate((60, 50, 40, 30, 20, 10), start=1)
+        }
     objects = []
     for relative, content in sorted(payloads.items()):
         suffix = relative.removeprefix(f"{assay}/lab/")
@@ -72,6 +80,11 @@ def _write_lab_snapshot(remote_root: Path, donor: str) -> dict[str, bytes]:
         ).encode(),
     }
     donor_root = remote_root / donor
+    lab_root = donor_root / assay / "lab"
+    if lab_root.is_dir():
+        for stale in lab_root.iterdir():
+            if stale.is_file() and f"{assay}/lab/{stale.name}" not in all_files:
+                stale.unlink()
     for relative, content in all_files.items():
         path = donor_root / relative
         path.parent.mkdir(parents=True, exist_ok=True)

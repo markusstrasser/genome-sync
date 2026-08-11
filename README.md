@@ -74,25 +74,33 @@ genome-sync sync --only results --yes
 genome-sync --dest ~/Genome/donor-id donor-id      # asks results / lab / both
 ```
 
-`.genome-manifest.json` schema 5 separates the validated remote activation from
+`.genome-manifest.json` schema 6 separates the validated remote activation from
 local materialization through `materialization`, `unavailable_files`,
 `retained_files`, and per-assay `local_materialization_complete` fields. Files
 carried from a section outside the current sync are rehashed before being
 carried forward; missing or corrupt files move to `unavailable_files` and force
 materialization incomplete.
 
-Retention is the default. A previously managed file that the new active snapshot
-no longer names stays on disk and moves to `retained_files` — recorded apart from
-`files` so nothing reads it as part of that snapshot, and never citable as
-activated evidence. Deleting those files is a separate explicit choice:
+Retention is the default, and retained files live in a **retention attic**. A
+previously managed file that the new active snapshot no longer names keeps its
+bytes but is moved to `_retained/<original path>` and recorded in
+`retained_files` (keyed by attic path, carrying `original_path`) — so the live
+tree outside `_retained/` is always exactly the active snapshot, and a later
+reader (human or agent) can never mistake a dropped file for activated
+evidence. `_retained/README.md` states this in place. A snapshot that re-adds a
+retained file restores it from the attic without re-downloading. Deleting
+retained bytes is a separate explicit choice:
 
 ```bash
 genome-sync sync --prune
 ```
 
-This exists because unconditional pruning is not safe against a bad remote plan:
-on 2026-07-29 a broken 32-stage active plan pruned a donor's 15.15 GB local
-snapshot down to 0.78 GB.
+This split exists because unconditional pruning is not safe against a bad remote
+plan: on 2026-07-29 a broken 32-stage active plan pruned a donor's 15.15 GB
+local snapshot down to 0.78 GB. A move is reversible where a delete is not, so
+the attic keeps the incident-guard while keeping the live tree honest. Pre-attic
+(schema 5) manifests migrate on the next sync of each section: in-place retained
+files are moved into the attic then.
 
 ## Concurrent downloads
 
@@ -128,8 +136,9 @@ uv run pytest
 
 The integration suite uses a deterministic local B2 double. It covers saved
 choices, the section question on both the configured and one-off paths, reading
-a pre-v4 config, retention-by-default (kept across repeated
-syncs, removed only under `--prune`, corrupt leftovers disclosed as unavailable),
+a pre-v4 config, retention-by-default (retired into `_retained/` and kept across
+repeated syncs, restored from the attic when a snapshot re-adds a file, removed
+only under `--prune`, corrupt leftovers disclosed as unavailable),
 and concurrent downloads (`--jobs 4` lands every object with correct bytes,
 `--jobs 4` and `--jobs 1` produce identical manifest records, a mid-run fetch
 failure still fails closed without replacing pre-existing files, and out-of-range

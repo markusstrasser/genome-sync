@@ -376,7 +376,7 @@ def test_lab_only_sync_audits_carried_results_and_normalizes_active_record(
     completed = _run(client, "sync", "--yes")
     assert completed.returncode == 0, completed.stderr + completed.stdout
     manifest = _manifest(client)
-    assert manifest["schema"] == 5
+    assert manifest["schema"] == 6
     assert manifest["retained_files"] == {}
     active = manifest["active_results"]["shortread"]
     assert active["remote_activation_validated"] is True
@@ -407,37 +407,85 @@ RETIRED_RELATIVE = "shortread/lab/retired-payload.bin"
 RETIRED_CONTENT = b"retired-lab-payload"
 
 
-def test_absent_remote_file_is_retained_by_default(
+RETIRED_ATTIC = f"_retained/{RETIRED_RELATIVE}"
+
+
+def test_absent_remote_file_is_retired_to_attic_by_default(
     fake_genome_sync: FakeGenomeSync,
 ) -> None:
     client = fake_genome_sync
     _setup(client)
     _seed_absent_remote_lab_file(client, RETIRED_RELATIVE, RETIRED_CONTENT)
     retired_path = client.destination / RETIRED_RELATIVE
+    attic_path = client.destination / RETIRED_ATTIC
 
     completed = _run(client, "sync", "--yes")
     assert completed.returncode == 0, completed.stderr + completed.stdout
-    assert "1 kept (no longer in the active snapshot)" in completed.stdout
+    assert "1 to retire to _retained/" in completed.stdout
     assert "to remove" not in completed.stdout
-    assert retired_path.read_bytes() == RETIRED_CONTENT
+    assert not retired_path.exists()
+    assert attic_path.read_bytes() == RETIRED_CONTENT
+    assert (client.destination / "_retained" / "README.md").is_file()
 
     manifest = _manifest(client)
-    assert manifest["schema"] == 5
+    assert manifest["schema"] == 6
     assert RETIRED_RELATIVE not in manifest["files"]
     assert RETIRED_RELATIVE not in manifest["unavailable_files"]
-    retained = manifest["retained_files"][RETIRED_RELATIVE]
+    assert RETIRED_RELATIVE not in manifest["retained_files"]
+    retained = manifest["retained_files"][RETIRED_ATTIC]
     assert retained["size"] == len(RETIRED_CONTENT)
     assert retained["sha256"] == hashlib.sha256(RETIRED_CONTENT).hexdigest()
     assert retained["proof"] == "activated_plan_sha256_verified"
     assert retained["reason"] == "absent_from_active_snapshot"
+    assert retained["original_path"] == RETIRED_RELATIVE
+    assert "_retained/README.md" in manifest["protected_local_paths"]
     assert manifest["materialization"]["retained_file_count"] == 1
     assert manifest["materialization"]["retained_bytes"] == len(RETIRED_CONTENT)
     assert manifest["materialization"]["complete"] is True
 
     repeated = _run(client, "sync", "--yes")
     assert repeated.returncode == 0, repeated.stderr + repeated.stdout
-    assert retired_path.read_bytes() == RETIRED_CONTENT
-    assert RETIRED_RELATIVE in _manifest(client)["retained_files"]
+    assert "1 in _retained/" in repeated.stdout
+    assert "to retire" not in repeated.stdout
+    assert attic_path.read_bytes() == RETIRED_CONTENT
+    assert RETIRED_ATTIC in _manifest(client)["retained_files"]
+
+
+def test_snapshot_readding_a_retired_file_restores_it_from_the_attic(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    from pathlib import Path as _Path
+
+    from conftest import _write_lab_snapshot
+
+    client = fake_genome_sync
+    remote_root = _Path(client.environment["FAKE_B2_ROOT"])
+    dropped_relative = sorted(client.payloads)[0]
+    dropped_content = client.payloads[dropped_relative]
+    _setup(client)
+
+    shrunken = {
+        relative: content
+        for relative, content in client.payloads.items()
+        if relative != dropped_relative
+    }
+    _write_lab_snapshot(remote_root, client.donor, shrunken)
+    completed = _run(client, "sync", "--yes")
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    live_path = client.destination / dropped_relative
+    attic_path = client.destination / "_retained" / dropped_relative
+    assert not live_path.exists()
+    assert attic_path.read_bytes() == dropped_content
+
+    _write_lab_snapshot(remote_root, client.donor, dict(client.payloads))
+    restored = _run(client, "sync", "--yes")
+    assert restored.returncode == 0, restored.stderr + restored.stdout
+    assert "reused" in restored.stdout
+    assert live_path.read_bytes() == dropped_content
+    manifest = _manifest(client)
+    assert dropped_relative in manifest["files"]
+    # The attic copy stays retained until an explicit --prune clears it.
+    assert f"_retained/{dropped_relative}" in manifest["retained_files"]
 
 
 def test_prune_removes_file_absent_from_active_snapshot(
@@ -451,7 +499,7 @@ def test_prune_removes_file_absent_from_active_snapshot(
     completed = _run(client, "sync", "--prune", "--yes")
     assert completed.returncode == 0, completed.stderr + completed.stdout
     assert "1 to remove" in completed.stdout
-    assert "kept (no longer in the active snapshot)" not in completed.stdout
+    assert "to retire" not in completed.stdout
     assert not retired_path.exists()
 
     manifest = _manifest(client)
@@ -460,6 +508,28 @@ def test_prune_removes_file_absent_from_active_snapshot(
     assert RETIRED_RELATIVE not in manifest["unavailable_files"]
     assert manifest["materialization"]["retained_file_count"] == 0
     assert manifest["materialization"]["complete"] is True
+
+
+def test_prune_empties_the_attic_and_removes_its_readme(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _setup(client)
+    _seed_absent_remote_lab_file(client, RETIRED_RELATIVE, RETIRED_CONTENT)
+
+    retained = _run(client, "sync", "--yes")
+    assert retained.returncode == 0, retained.stderr + retained.stdout
+    attic_path = client.destination / RETIRED_ATTIC
+    assert attic_path.is_file()
+    assert (client.destination / "_retained" / "README.md").is_file()
+
+    pruned = _run(client, "sync", "--prune", "--yes")
+    assert pruned.returncode == 0, pruned.stderr + pruned.stdout
+    assert not attic_path.exists()
+    assert not (client.destination / "_retained").exists()
+    manifest = _manifest(client)
+    assert manifest["retained_files"] == {}
+    assert "_retained/README.md" not in manifest["protected_local_paths"]
 
 
 def test_corrupt_retained_file_is_reported_unavailable(
@@ -474,14 +544,17 @@ def test_corrupt_retained_file_is_reported_unavailable(
 
     completed = _run(client, "sync", "--yes")
     assert completed.returncode == 0, completed.stderr + completed.stdout
-    assert retired_path.read_bytes() == corrupted
+    attic_path = client.destination / RETIRED_ATTIC
+    assert not retired_path.exists()
+    assert attic_path.read_bytes() == corrupted
 
     manifest = _manifest(client)
-    assert RETIRED_RELATIVE not in manifest["retained_files"]
+    assert RETIRED_ATTIC not in manifest["retained_files"]
     assert RETIRED_RELATIVE not in manifest["files"]
-    unavailable = manifest["unavailable_files"][RETIRED_RELATIVE]
+    unavailable = manifest["unavailable_files"][RETIRED_ATTIC]
     assert unavailable["reason"] == "local_sha256_mismatch"
     assert unavailable["retained"] is True
+    assert unavailable["original_path"] == RETIRED_RELATIVE
     assert unavailable["observed_sha256"] == hashlib.sha256(corrupted).hexdigest()
     assert manifest["materialization"]["retained_unavailable_file_count"] == 1
     assert manifest["materialization"]["unavailable_file_count"] == 0
