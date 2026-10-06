@@ -1325,6 +1325,18 @@ def require_sha256(value, *, field):
         raise SystemExit(f"{field} must be a lowercase SHA-256")
     return value
 
+def currency_judgment_field(currency):
+    """Name the one judgment field a currency record must carry.
+
+    Snapshots published from 2026-08-14 (producer 072eb361c) carry
+    semantic_judgment_id; older ones carry equivalence_record_id. A record
+    carrying both fails the exact field-set check. Drop the older spelling
+    once no active donor snapshot uses it.
+    """
+    if isinstance(currency, dict) and "semantic_judgment_id" in currency:
+        return "semantic_judgment_id"
+    return "equivalence_record_id"
+
 def parse_authorized_at(value, *, prefix):
     if not isinstance(value, str):
         raise SystemExit(f"results authorized_at must be a timestamp: {prefix}")
@@ -1461,6 +1473,8 @@ def resolve_results_activation(*, assay, group):
             "excluded-stale-provenance",
             "excluded-dependency",
             "excluded-implausible",
+            # Producer 91fa13c45 (2026-08-06): sound method, restricted coverage.
+            "excluded-restricted-scope",
         }
         required_disposition_fields_v2 = {
             "stage",
@@ -1473,13 +1487,14 @@ def resolve_results_activation(*, assay, group):
             "currency",
             "blocked_by",
         }
+        # The judgment field (equivalence_record_id or semantic_judgment_id) is
+        # checked per record; see currency_judgment_field.
         required_currency_fields_v2 = {
             "decision_id",
             "disposition",
             "completion_eligible",
             "produced_identity_digest",
             "current_identity_digest",
-            "equivalence_record_id",
             "unresolved_reason_codes",
         }
         if root_schema == "donor-root-export-manifest/v3":
@@ -1534,9 +1549,10 @@ def resolve_results_activation(*, assay, group):
             state = disposition["state"]
             currency = disposition["currency"]
             if state in receipt_bound_states:
+                judgment_field = currency_judgment_field(currency)
                 if (
                     not isinstance(currency, dict)
-                    or set(currency) != required_currency_fields
+                    or set(currency) != required_currency_fields | {judgment_field}
                     or currency["disposition"] not in allowed_currency_dispositions
                     or type(currency["completion_eligible"]) is not bool
                     or currency["completion_eligible"]
@@ -1551,10 +1567,14 @@ def resolve_results_activation(*, assay, group):
                         f"result has malformed exact currency: {prefix}{stage}"
                     )
                 require_sha256(currency["decision_id"], field=f"{stage} currency decision_id")
+                judgment_id = currency[judgment_field]
+                if judgment_id:
+                    if judgment_field == "semantic_judgment_id" and isinstance(judgment_id, str):
+                        judgment_id = judgment_id.removeprefix("semantic-judgment:")
+                    require_sha256(judgment_id, field=f"{stage} currency {judgment_field}")
                 for digest_field in (
                     "produced_identity_digest",
                     "current_identity_digest",
-                    "equivalence_record_id",
                     *(
                         ("currentness_attestation_id",)
                         if root_schema == "donor-root-export-manifest/v3"
@@ -1578,7 +1598,7 @@ def resolve_results_activation(*, assay, group):
                         )
                         if (
                             not currentness_id
-                            or currency["equivalence_record_id"]
+                            or currency[judgment_field]
                             or (
                                 not currency["current_identity_digest"]
                                 and not classifier_unresolved
