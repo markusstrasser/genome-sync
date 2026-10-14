@@ -69,6 +69,14 @@ answer unprompted.
 The selected sections are downloaded whole. There is no per-file picking: a
 donor either has a section or does not.
 
+Large text files travel compressed and are unpacked and verified on arrival. A
+`donor-root-export-manifest/v4` snapshot may ship one gzip-encoded; the client
+checks the download, unpacks it with Python's standard library (capped at the
+declared size), and installs the plain file only once its size and SHA-256
+match the pipeline's. The local folder holds plain readable files, never `.gz`
+transport copies; the file's `.genome-manifest.json` record describes the plain
+bytes and names the stored object under `transport`.
+
 ```bash
 genome-sync sync --only results --yes
 genome-sync --dest ~/Genome/donor-id donor-id      # asks results / lab / both
@@ -142,4 +150,8 @@ only under `--prune`, corrupt leftovers disclosed as unavailable),
 and concurrent downloads (`--jobs 4` lands every object with correct bytes,
 `--jobs 4` and `--jobs 1` produce identical manifest records, a mid-run fetch
 failure still fails closed without replacing pre-existing files, and out-of-range
-or non-numeric `--jobs` values are rejected) without contacting Backblaze.
+or non-numeric `--jobs` values are rejected) without contacting Backblaze. It
+also covers v4 gzip transport: decoded installs at logical paths, decode
+failures that leave existing files untouched (wrong digest, oversized output,
+truncated or corrupt stream), reuse without re-downloading, the attic, and
+rejected manifests.

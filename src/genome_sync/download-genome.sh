@@ -557,10 +557,12 @@ fs_guard() {
   shift
   "${PY[@]}" - "$operation" "$DEST_ABS" "$@" <<'PYEOF'
 import errno
+import gzip
 import hashlib
 import os
 import stat
 import sys
+import zlib
 from pathlib import Path, PurePosixPath
 
 operation, root_text, *arguments = sys.argv[1:]
@@ -750,6 +752,68 @@ elif operation == "copy":
             os.close(source_fd)
     finally:
         os.close(parent_fd)
+elif operation == "gunzip":
+    # Stream-decode one verified gzip transport object (a private temp under the
+    # destination) into a second private temp and hash the decoded bytes. Output
+    # is capped at the activated logical size: a stream that decodes to more is
+    # rejected after at most that size plus one byte (decompression-bomb guard).
+    source_relative, target_text, limit_text = arguments
+    if not limit_text.isdigit():
+        fail("decode limit is not a non-negative integer")
+    limit = int(limit_text)
+    target = Path(target_text)
+    try:
+        target.relative_to(root)
+    except ValueError:
+        fail("temporary decode target escaped destination root")
+    target_stat = target.lstat()
+    if stat.S_ISLNK(target_stat.st_mode) or not stat.S_ISREG(target_stat.st_mode):
+        fail("temporary decode target is not a regular file")
+    parent_fd, name = open_parent(source_relative)
+    try:
+        source_fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+    with os.fdopen(source_fd, "rb") as source:
+        before = os.fstat(source.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            fail(f"decode source is not regular: {source_relative}")
+        target_fd = os.open(target, os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            sha1 = hashlib.sha1(usedforsecurity=False)
+            sha256 = hashlib.sha256()
+            decoded = 0
+            with gzip.GzipFile(fileobj=source, mode="rb") as stream:
+                while True:
+                    try:
+                        chunk = stream.read(min(8 * 1024 * 1024, limit - decoded + 1))
+                    except (OSError, EOFError, zlib.error) as error:
+                        raise SystemExit(
+                            f"transport object is not a valid gzip stream: {source_relative}: {error}"
+                        ) from None
+                    if not chunk:
+                        break
+                    decoded += len(chunk)
+                    if decoded > limit:
+                        raise SystemExit(
+                            f"transport decode exceeds the activated logical size of {limit} bytes: {source_relative}"
+                        )
+                    sha1.update(chunk)
+                    sha256.update(chunk)
+                    remaining = memoryview(chunk)
+                    while remaining:
+                        written = os.write(target_fd, remaining)
+                        if written <= 0:
+                            fail(f"could not write decoded transport object: {source_relative}")
+                        remaining = remaining[written:]
+            os.fsync(target_fd)
+        finally:
+            os.close(target_fd)
+        after = os.fstat(source.fileno())
+    identity = lambda value: (value.st_dev, value.st_ino, value.st_mode, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+    if identity(before) != identity(after):
+        fail(f"transport object changed while decoding: {source_relative}")
+    print(f"{decoded}\t{sha1.hexdigest()}\t{sha256.hexdigest()}")
 elif operation == "install":
     relative, temporary_text = arguments
     temporary = Path(temporary_text)
@@ -1127,6 +1191,9 @@ class ResultsActivation:
     authorized_at_text: str
     marker_sha256: str
     expected_sha256: dict[str, str]
+    # Stored key -> (logical local path, logical bytes, logical SHA-256) for each
+    # gzip transport object; the donor's tree holds only the decoded form.
+    encoded: dict[str, tuple[str, int, str]]
     group: tuple[RemoteObject, ...]
 
 def canonical_relative(value):
@@ -1437,9 +1504,23 @@ def resolve_results_activation(*, assay, group):
     supported_root_schemas = {
         "donor-root-export-manifest/v2",
         "donor-root-export-manifest/v3",
+        "donor-root-export-manifest/v4",
     }
+    # v4 is v3 plus transport encoding: objects may travel gzip-compressed and are
+    # installed decoded at their logical path. Its dispositions are v3's.
+    transport_encoded = root_schema == "donor-root-export-manifest/v4"
+    v3_dispositions = root_schema in {
+        "donor-root-export-manifest/v3",
+        "donor-root-export-manifest/v4",
+    }
+    if transport_encoded:
+        required_root_fields = required_root_fields | {"transport_codec"}
     if set(root) != required_root_fields or root_schema not in supported_root_schemas:
         raise SystemExit(f"results root manifest has an unexpected schema: {prefix}")
+    if transport_encoded:
+        transport_codec = root["transport_codec"]
+        if not isinstance(transport_codec, dict) or transport_codec.get("codec") != "gzip":
+            raise SystemExit(f"results root manifest transport codec is not gzip: {prefix}")
     if (
         root["sample_id"] != sample_id
         or root["donor_id"] != donor
@@ -1497,7 +1578,7 @@ def resolve_results_activation(*, assay, group):
             "current_identity_digest",
             "unresolved_reason_codes",
         }
-        if root_schema == "donor-root-export-manifest/v3":
+        if v3_dispositions:
             required_disposition_fields = required_disposition_fields_v2 | {
                 "evidence_kind",
                 "action_key",
@@ -1534,7 +1615,7 @@ def resolve_results_activation(*, assay, group):
                 or set(disposition) != required_disposition_fields
                 or disposition["state"] not in allowed_states
                 or (
-                    root_schema == "donor-root-export-manifest/v3"
+                    v3_dispositions
                     and (
                         not isinstance(disposition["evidence_kind"], str)
                         or disposition["evidence_kind"] not in {"cass_current", "action_key"}
@@ -1577,7 +1658,7 @@ def resolve_results_activation(*, assay, group):
                     "current_identity_digest",
                     *(
                         ("currentness_attestation_id",)
-                        if root_schema == "donor-root-export-manifest/v3"
+                        if v3_dispositions
                         else ()
                     ),
                 ):
@@ -1586,7 +1667,7 @@ def resolve_results_activation(*, assay, group):
                             currency[digest_field],
                             field=f"{stage} currency {digest_field}",
                         )
-                if root_schema == "donor-root-export-manifest/v3":
+                if v3_dispositions:
                     currentness_id = currency["currentness_attestation_id"]
                     if currency["disposition"] == "ATTESTED_CURRENT":
                         classifier_unresolved = bool(
@@ -1623,7 +1704,7 @@ def resolve_results_activation(*, assay, group):
                     disposition["receipt_sha256"],
                     field=f"{stage} current receipt",
                 )
-                if root_schema == "donor-root-export-manifest/v3":
+                if v3_dispositions:
                     if (
                         not isinstance(disposition["current_pointer_sha256"], str)
                         or not isinstance(currency["identity_scheme"], str)
@@ -1705,14 +1786,26 @@ def resolve_results_activation(*, assay, group):
     if not isinstance(objects, list) or not objects:
         raise SystemExit(f"results root manifest requires a non-empty object list: {prefix}")
 
+    plain_object_fields = {"path", "bytes", "sha256"}
+    encoded_object_fields = plain_object_fields | {
+        "encoding",
+        "logical_path",
+        "logical_bytes",
+        "logical_sha256",
+    }
+    reserved_paths = {"_COMPLETE.json", "manifest.json"}
     expected = {}
+    encoded = {}
     root_object_bytes = 0
     object_set = []
     for item in objects:
-        if not isinstance(item, dict) or set(item) != {"path", "bytes", "sha256"}:
+        if not isinstance(item, dict) or not (
+            set(item) == plain_object_fields
+            or (transport_encoded and set(item) == encoded_object_fields)
+        ):
             raise SystemExit(f"results root manifest object has an unexpected schema: {prefix}")
         relative_path = canonical_relative(item["path"])
-        if relative_path in {"_COMPLETE.json", "manifest.json"} or relative_path in expected:
+        if relative_path in reserved_paths or relative_path in expected:
             raise SystemExit(f"results root manifest paths are duplicate or reserved: {prefix}")
         object_bytes = require_nonnegative_integer(
             item["bytes"], field=f"results object bytes {relative_path}"
@@ -1720,6 +1813,29 @@ def resolve_results_activation(*, assay, group):
         object_sha256 = require_sha256(
             item["sha256"], field=f"results object SHA-256 {relative_path}"
         )
+        if "encoding" in item:
+            # bytes/sha256 above describe the STORED gzip object; the logical
+            # triple describes the plain file the donor's tree must end up with.
+            if item["encoding"] != "gzip":
+                raise SystemExit(
+                    f"results object has an unsupported transport encoding: {prefix}{relative_path}"
+                )
+            logical_path = canonical_relative(item["logical_path"])
+            if logical_path in reserved_paths:
+                raise SystemExit(f"results object encodes a reserved name: {prefix}{logical_path}")
+            if relative_path != logical_path + ".gz":
+                raise SystemExit(
+                    f"results transport path is not its logical path plus .gz: {prefix}{relative_path}"
+                )
+            encoded[relative_path] = (
+                logical_path,
+                require_nonnegative_integer(
+                    item["logical_bytes"], field=f"results object logical bytes {relative_path}"
+                ),
+                require_sha256(
+                    item["logical_sha256"], field=f"results object logical SHA-256 {relative_path}"
+                ),
+            )
         expected[relative_path] = (object_bytes, object_sha256)
         root_object_bytes += object_bytes
         object_set.append({"path": relative_path, "bytes": object_bytes, "sha256": object_sha256})
@@ -1727,6 +1843,17 @@ def resolve_results_activation(*, assay, group):
         raise SystemExit(f"results root manifest paths are not canonical sorted order: {prefix}")
     if root_count != len(expected) or root_bytes_count != root_object_bytes:
         raise SystemExit(f"results root manifest totals differ from its objects: {prefix}")
+    # A decoded object is installed at its logical path, so that path must name
+    # nothing else. Logical paths are unique among themselves (each is a unique
+    # stored path minus ".gz") and are never reserved (checked above); none may
+    # equal any stored object's path.
+    logical_collisions = sorted(
+        {logical_path for logical_path, _bytes, _sha256 in encoded.values()} & set(expected)
+    )
+    if logical_collisions:
+        raise SystemExit(
+            f"results logical path collides with another object: {prefix}{logical_collisions[0]}"
+        )
 
     manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
     expected["manifest.json"] = (len(manifest_bytes), manifest_sha256)
@@ -1771,6 +1898,10 @@ def resolve_results_activation(*, assay, group):
         authorized_at_text=authorized_at_text,
         marker_sha256=hashlib.sha256(marker_bytes).hexdigest(),
         expected_sha256=expected_sha256,
+        encoded={
+            prefix + relative_path: (prefix + logical_path, logical_bytes, logical_sha256)
+            for relative_path, (logical_path, logical_bytes, logical_sha256) in encoded.items()
+        },
         group=tuple(group),
     )
 
@@ -1921,16 +2052,25 @@ active_results_path.write_text(
     encoding="utf-8",
 )
 
+# Each row: (remote object, stored SHA-256, local path, transport). transport is
+# None for plain objects, else (logical local path, logical bytes, logical SHA-256)
+# and the local path is the logical one: encoded names never reach the tree.
 projected_rows = []
 for remote in selected:
     if remote.section == "lab" and remote.relative in expected_lab_sha256:
-        projected_rows.append((remote, expected_lab_sha256[remote.relative], remote.relative))
+        projected_rows.append((remote, expected_lab_sha256[remote.relative], remote.relative, None))
     elif remote.section == "ensemble":
-        projected_rows.append((remote, "unbound", remote.relative))
+        projected_rows.append((remote, "unbound", remote.relative, None))
 for activation in active_by_assay.values():
     for remote in activation.group:
+        transport = activation.encoded.get(remote.relative)
         projected_rows.append(
-            (remote, activation.expected_sha256[remote.relative], remote.relative)
+            (
+                remote,
+                activation.expected_sha256[remote.relative],
+                remote.relative if transport is None else transport[0],
+                transport,
+            )
         )
 
 if active_by_assay:
@@ -1949,19 +2089,30 @@ if active_by_assay:
                 f"active results view lacks required root agent asset {asset_path}: "
                 f"{root_source.assay}/results"
             )
+        # Root assets are looked up by their plain name; an encoded object's
+        # stored path always ends in .gz, so these are never transport-encoded.
         projected_rows.append(
-            (remote, root_source.expected_sha256[remote.relative], asset_path)
+            (remote, root_source.expected_sha256[remote.relative], asset_path, None)
         )
 
-local_paths = [local_relative for _remote, _sha256, local_relative in projected_rows]
+local_paths = [local_relative for _remote, _sha256, local_relative, _transport in projected_rows]
 if len(local_paths) != len(set(local_paths)):
     raise SystemExit("activated objects collide after local bundle projection")
-for remote, expected_sha256, local_relative in sorted(
+# Row columns (every plan TSV reader depends on this order): remote SHA-1,
+# stored bytes, stored SHA-256, B2 key, local path, encoding, local bytes, local
+# SHA-256. A plain row's encoding is "identity" and its local identity is its
+# stored identity; a gzip row's local identity is the decoded logical file.
+for remote, expected_sha256, local_relative, transport in sorted(
     projected_rows, key=lambda item: item[2]
 ):
+    if transport is None:
+        encoding, logical_size, logical_sha256 = "identity", remote.size, expected_sha256
+    else:
+        encoding = "gzip"
+        _logical_path, logical_size, logical_sha256 = transport
     print(
         f"{remote.remote_sha1}\t{remote.size}\t{expected_sha256}\t"
-        f"{remote.key}\t{local_relative}"
+        f"{remote.key}\t{local_relative}\t{encoding}\t{logical_size}\t{logical_sha256}"
     )
 PYEOF
 
@@ -2012,7 +2163,9 @@ root = Path(sys.argv[1])
 manifest_name = sys.argv[2]
 manifest_donor = sys.argv[3]
 
-def canonical_relative(path: Path) -> str | None:
+# Quoted: the engine runs on the donor's first python3, which can be macOS's 3.9,
+# where an unquoted `str | None` annotation raises TypeError at definition time.
+def canonical_relative(path: Path) -> "str | None":
     try:
         relative = path.relative_to(root).as_posix()
     except ValueError:
@@ -2108,23 +2261,41 @@ PYEOF
 fi
 
 new=0; changed=0; unchanged=0; reused=0; total_xfer=0; local_reuse_bytes=0
+# Disk need: bytes that end up installed, plus the stored gzip temps that can sit
+# beside their decoded output (at most JOBS of them in flight at once).
+install_bytes=0; encoded_downloads=0; max_encoded_stored=0
 scan_index=0; scan_count=$(wc -l < "$FILTERED" | tr -d ' ')
-while IFS=$'\t' read -r remote_sha1 size expected_sha256 key relative; do
+# TODO columns: state, remote SHA-1, stored bytes, stored SHA-256, B2 key, local
+# path, encoding, local bytes, local SHA-256, reuse source. The reuse source stays
+# LAST: it may be empty, and `read` collapses consecutive tabs mid-line.
+while IFS=$'\t' read -r remote_sha1 size expected_sha256 key relative encoding logical_size logical_sha256; do
   [ -n "$relative" ] || continue
+  case "$encoding" in identity|gzip) ;; *) say "${R}malformed verified plan row: ${relative}${X}"; exit 1 ;; esac
   scan_index=$((scan_index + 1))
   local_path="${DEST_ABS}/${relative}"
+  # A gzip row is installed decoded, so the local file is judged by its logical
+  # identity, never by the stored transport object's bytes.
+  if [ "$encoding" = "gzip" ]; then
+    local_size="$logical_size"; local_sha256="$logical_sha256"
+  else
+    local_size="$size"; local_sha256="$expected_sha256"
+  fi
   if [ ! -e "$local_path" ]; then
     new=$((new + 1))
     reuse_source=""
-    if [ "$expected_sha256" != "unbound" ]; then
-      reuse_source="$(awk -F '\t' -v wanted_size="$size" -v wanted_sha256="$expected_sha256" '$1 == wanted_size && $3 == wanted_sha256 {print $4; exit}' "$LOCAL_INDEX")"
+    if [ "$local_sha256" != "unbound" ]; then
+      reuse_source="$(awk -F '\t' -v wanted_size="$local_size" -v wanted_sha256="$local_sha256" '$1 == wanted_size && $3 == wanted_sha256 {print $4; exit}' "$LOCAL_INDEX")"
     fi
     if [ -n "$reuse_source" ]; then
-      reused=$((reused + 1)); local_reuse_bytes=$((local_reuse_bytes + size))
-      printf 'reused-local\t%s\t%s\t%s\t%s\t%s\t%s\n' "$remote_sha1" "$size" "$expected_sha256" "$key" "$relative" "$reuse_source" >> "$TODO"
+      reused=$((reused + 1)); local_reuse_bytes=$((local_reuse_bytes + local_size))
+      printf 'reused-local\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$remote_sha1" "$size" "$expected_sha256" "$key" "$relative" "$encoding" "$logical_size" "$logical_sha256" "$reuse_source" >> "$TODO"
     else
-      total_xfer=$((total_xfer + size))
-      printf 'new\t%s\t%s\t%s\t%s\t%s\t\n' "$remote_sha1" "$size" "$expected_sha256" "$key" "$relative" >> "$TODO"
+      total_xfer=$((total_xfer + size)); install_bytes=$((install_bytes + local_size))
+      if [ "$encoding" = "gzip" ]; then
+        encoded_downloads=$((encoded_downloads + 1))
+        [ "$size" -gt "$max_encoded_stored" ] && max_encoded_stored="$size"
+      fi
+      printf 'new\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t\n' "$remote_sha1" "$size" "$expected_sha256" "$key" "$relative" "$encoding" "$logical_size" "$logical_sha256" >> "$TODO"
     fi
   elif [ ! -f "$local_path" ] || [ -L "$local_path" ]; then
     say "${R}unsafe local target: ${relative}${X}"; exit 1
@@ -2134,19 +2305,29 @@ while IFS=$'\t' read -r remote_sha1 size expected_sha256 key relative; do
 $observed
 EOF
     local_matches=0
-    if [ "$expected_sha256" != "unbound" ]; then
-      [ "$observed_size" = "$size" ] && [ "$observed_sha256" = "$expected_sha256" ] && local_matches=1
+    if [ "$local_sha256" != "unbound" ]; then
+      [ "$observed_size" = "$local_size" ] && [ "$observed_sha256" = "$local_sha256" ] && local_matches=1
     elif [ "$remote_sha1" != "unverified" ]; then
       [ "$observed_size" = "$size" ] && [ "$observed_sha1" = "$remote_sha1" ] && local_matches=1
     fi
     if [ "$local_matches" -eq 1 ]; then
       unchanged=$((unchanged + 1))
-      if [ "$expected_sha256" = "unbound" ]; then proof="remote_sha1_verified"; else proof="activated_plan_sha256_verified"; fi
-      printf '%s\t%s\t%s\t%s\t%s\n' "$relative" "$size" "$remote_sha1" "$observed_sha256" "$proof" >> "$HASHES"
+      if [ "$encoding" = "gzip" ]; then
+        # The local file is the decoded form: no B2 object ever held these exact
+        # bytes, so there is no remote SHA-1 to record for them.
+        printf '%s\t%s\t%s\t%s\t%s\n' "$relative" "$local_size" "unverified" "$observed_sha256" "activated_plan_logical_sha256_verified" >> "$HASHES"
+      else
+        if [ "$expected_sha256" = "unbound" ]; then proof="remote_sha1_verified"; else proof="activated_plan_sha256_verified"; fi
+        printf '%s\t%s\t%s\t%s\t%s\n' "$relative" "$size" "$remote_sha1" "$observed_sha256" "$proof" >> "$HASHES"
+      fi
     else
-      changed=$((changed + 1)); total_xfer=$((total_xfer + size))
+      changed=$((changed + 1)); total_xfer=$((total_xfer + size)); install_bytes=$((install_bytes + local_size))
+      if [ "$encoding" = "gzip" ]; then
+        encoded_downloads=$((encoded_downloads + 1))
+        [ "$size" -gt "$max_encoded_stored" ] && max_encoded_stored="$size"
+      fi
       if [ "$remote_sha1" = "unverified" ]; then state="updated-unverified"; else state="updated"; fi
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t\n' "$state" "$remote_sha1" "$size" "$expected_sha256" "$key" "$relative" >> "$TODO"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t\n' "$state" "$remote_sha1" "$size" "$expected_sha256" "$key" "$relative" "$encoding" "$logical_size" "$logical_sha256" >> "$TODO"
     fi
   fi
   render_progress 0 0 "$scan_index" "$scan_count" "checking · $(progress_subject "$relative")"
@@ -2187,12 +2368,12 @@ fi
 
 say "  ${B}Changes:${X} ${G}${new} new${X} · ${BL}${changed} updated${X} · ${D}${unchanged} unchanged${X}$( [ "$reused" -gt 0 ] && printf " · ${G}%s reused locally%s" "$reused" "$X" )${absent_summary}"
 say "  ${B}Transfer:${X} $(human "$total_xfer") ${B}→${X} ${DEST_ABS}"
-log_event "preview new=${new} updated=${changed} unchanged=${unchanged} reused=${reused} absent_remotely=${prune_n} prune=${PRUNE} transfer_bytes=${total_xfer}"
+log_event "preview new=${new} updated=${changed} unchanged=${unchanged} reused=${reused} absent_remotely=${prune_n} prune=${PRUNE} transfer_bytes=${total_xfer} gzip_transport_files=${encoded_downloads}"
 if [ "$DRYRUN" -eq 1 ]; then
   [ "$reused" -gt 0 ] && {
     say "\n  ${D}would reuse ${reused} local file(s):${X}"
     awk -F '\t' -v limit=25 '
-      $1 == "reused-local" { count++; if (count <= limit) print "    " $6 " <- " $7 }
+      $1 == "reused-local" { count++; if (count <= limit) print "    " $6 " <- " $10 }
       END { if (count > limit) printf "    … %d more files\n", count - limit }
     ' "$TODO"
   }
@@ -2238,7 +2419,10 @@ if [ "$confirmation_required" -eq 1 ] && ! confirm "  Apply this verified update
   exit 0
 fi
 
-NEED_KB=$(awk "BEGIN{printf \"%d\", (${total_xfer}+${local_reuse_bytes})/1024*1.1}")
+# Installed bytes are what the tree keeps (decoded size for gzip rows); each
+# in-flight gzip transport temp coexists with its decoded output until install.
+transport_peak_bytes=$((max_encoded_stored * JOBS))
+NEED_KB=$(awk "BEGIN{printf \"%d\", (${install_bytes}+${local_reuse_bytes}+${transport_peak_bytes})/1024*1.1}")
 FREE_KB=$(df -Pk "$DEST_ABS" | awk 'NR==2{print $4}')
 if [ "${FREE_KB:-0}" -lt "${NEED_KB:-0}" ]; then
   say "\n${R}  Not enough free disk space.${X}"
@@ -2311,7 +2495,7 @@ start_prefetch() {
   (
     trap - EXIT HUP INT TERM
     producer_index=0
-    while IFS=$'\t' read -r state remote_sha1 size expected_sha256 key relative reuse_source; do
+    while IFS=$'\t' read -r state remote_sha1 size expected_sha256 key relative encoding logical_size logical_sha256 reuse_source; do
       producer_index=$((producer_index + 1))
       if [ "$state" = "reused-local" ] && [ -n "$reuse_source" ]; then
         continue
@@ -2351,7 +2535,7 @@ if [ -s "$TODO" ]; then
   completed_work=0; total_work=$((total_xfer + local_reuse_bytes))
   PREFETCH_RESULT=""; PREFETCH_TEMP=""
   [ "$JOBS" -gt 1 ] && start_prefetch
-  while IFS=$'\t' read -r state remote_sha1 size expected_sha256 key relative reuse_source; do
+  while IFS=$'\t' read -r state remote_sha1 size expected_sha256 key relative encoding logical_size logical_sha256 reuse_source; do
     item_index=$((item_index + 1))
     if [ ! -t 1 ]; then
       say "  ${B}▸${X} [${item_index}/${item_count}] ${relative} ${D}($(human "$size"), ${state})${X}"
@@ -2369,6 +2553,7 @@ if [ -s "$TODO" ]; then
       fi
     fi
     observed=""
+    item_reused=0
     if [ "$item_prefetched" -eq 1 ]; then
       render_progress "$completed_work" "$total_work" "$item_index" "$item_count" "$(progress_subject "$relative")"
       wait_for_prefetch "$item_index"
@@ -2390,13 +2575,24 @@ if [ -s "$TODO" ]; then
           IFS=$'\t' read -r observed_size observed_sha1 observed_sha256 <<EOF
 $observed
 EOF
-          if [ "$observed_size" != "$size" ] \
+          # Reused bytes are what will sit on disk. A gzip row compares them with
+          # its logical identity only; its stored transport object is never fetched.
+          reuse_matches=1
+          if [ "$encoding" = "gzip" ]; then
+            if [ "$observed_size" != "$logical_size" ] || [ "$observed_sha256" != "$logical_sha256" ]; then
+              reuse_matches=0
+            fi
+          elif [ "$observed_size" != "$size" ] \
             || { [ "$remote_sha1" != "unverified" ] && [ "$observed_sha1" != "$remote_sha1" ]; } \
             || { [ "$expected_sha256" != "unbound" ] && [ "$observed_sha256" != "$expected_sha256" ]; }; then
+            reuse_matches=0
+          fi
+          if [ "$reuse_matches" -eq 0 ]; then
             progress_newline
             say "  ${Y}Local reuse candidate changed; downloading ${relative}.${X}"
             observed=""
           else
+            item_reused=1
             [ ! -t 1 ] && say "    ${D}reused verified local content from ${reuse_source}${X}"
           fi
         else
@@ -2441,26 +2637,66 @@ EOF
     IFS=$'\t' read -r observed_size observed_sha1 observed_sha256 <<EOF
 $observed
 EOF
-    if [ "$observed_size" != "$size" ]; then
-      say "${R}download size mismatch for ${relative}${X}"; exit 1
-    fi
-    if [ "$remote_sha1" != "unverified" ] && [ "$observed_sha1" != "$remote_sha1" ]; then
-      say "${R}download SHA-1 mismatch for ${relative}${X}"; exit 1
-    fi
-    if [ "$expected_sha256" != "unbound" ] && [ "$observed_sha256" != "$expected_sha256" ]; then
-      say "${R}download SHA-256 violates activated plan for ${relative}${X}"; exit 1
+    install_temporary="$temporary"
+    transport_temporary=""
+    item_work="$size"
+    if [ "$item_reused" -eq 1 ] && [ "$encoding" = "gzip" ]; then
+      # Already verified above against the logical identity of the decoded file.
+      proof="activated_plan_logical_sha256_verified"
+      item_work="$logical_size"
+    else
+      if [ "$observed_size" != "$size" ]; then
+        say "${R}download size mismatch for ${relative}${X}"; exit 1
+      fi
+      if [ "$remote_sha1" != "unverified" ] && [ "$observed_sha1" != "$remote_sha1" ]; then
+        say "${R}download SHA-1 mismatch for ${relative}${X}"; exit 1
+      fi
+      if [ "$expected_sha256" != "unbound" ] && [ "$observed_sha256" != "$expected_sha256" ]; then
+        say "${R}download SHA-256 violates activated plan for ${relative}${X}"; exit 1
+      fi
+      if [ "$encoding" = "gzip" ]; then
+        # The verified stored object is a gzip transport encoding: decode it into
+        # a second private temp (capped at the logical size), then hold the decoded
+        # bytes to the activated logical size and SHA-256 before anything installs.
+        decoded_temporary="$(mktemp "${TEMP_ROOT}/decoded.XXXXXX")" || exit 1
+        chmod 600 "$decoded_temporary"
+        if ! decoded="$(fs_guard gunzip "$temp_relative" "$decoded_temporary" "$logical_size")"; then
+          progress_newline
+          say "${R}gzip transport object failed to decode for ${relative}; existing file was not replaced.${X}"
+          exit 1
+        fi
+        IFS=$'\t' read -r observed_size observed_sha1 observed_sha256 <<EOF
+$decoded
+EOF
+        if [ "$observed_size" != "$logical_size" ]; then
+          say "${R}decoded size mismatch for ${relative}${X}"; exit 1
+        fi
+        if [ "$observed_sha256" != "$logical_sha256" ]; then
+          say "${R}decoded SHA-256 violates activated plan for ${relative}${X}"; exit 1
+        fi
+        install_temporary="$decoded_temporary"
+        transport_temporary="$temporary"
+        proof="activated_plan_gzip_decoded_sha256_verified"
+        log_event "file decode encoding=gzip stored_bytes=${size} logical_bytes=${observed_size} path=${relative}"
+      elif [ "$expected_sha256" != "unbound" ]; then
+        proof="activated_plan_sha256_verified"
+      elif [ "$remote_sha1" = "unverified" ]; then
+        proof="downloaded_local_sha256_remote_sha1_unavailable"
+      else
+        proof="remote_sha1_verified"
+      fi
     fi
     fs_guard validate-tree || exit 1
-    fs_guard install "$relative" "$temporary" || exit 1
-    if [ "$expected_sha256" != "unbound" ]; then
-      proof="activated_plan_sha256_verified"
-    elif [ "$remote_sha1" = "unverified" ]; then
-      proof="downloaded_local_sha256_remote_sha1_unavailable"
+    fs_guard install "$relative" "$install_temporary" || exit 1
+    [ -n "$transport_temporary" ] && { rm -f -- "$transport_temporary" || exit 1; }
+    if [ "$encoding" = "gzip" ]; then
+      # Recorded as what is on disk: the decoded size and digest, with no remote
+      # SHA-1 (the manifest step attaches the stored transport identity).
+      printf '%s\t%s\t%s\t%s\t%s\n' "$relative" "$observed_size" "unverified" "$observed_sha256" "$proof" >> "$HASHES"
     else
-      proof="remote_sha1_verified"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$relative" "$size" "$remote_sha1" "$observed_sha256" "$proof" >> "$HASHES"
     fi
-    printf '%s\t%s\t%s\t%s\t%s\n' "$relative" "$size" "$remote_sha1" "$observed_sha256" "$proof" >> "$HASHES"
-    completed_work=$((completed_work + size))
+    completed_work=$((completed_work + item_work))
     render_progress "$completed_work" "$total_work" "$item_index" "$item_count" "$(progress_subject "$relative")"
     log_event "file finish index=${item_index}/${item_count} bytes=${size} path=${relative} proof=${proof}"
     # Return the pipeline slot only now, after the item is verified and installed,
@@ -2639,6 +2875,7 @@ for assay, record in sorted(active.items()):
         "",
         "Read `../.genome-manifest.json` first. Its `active_results` entry identifies the exact plan and local results path. Then read `results/AGENTS.md` for the evidence and interpretation contract and `results/TOC.md` to locate stages.",
         "The remote activation and the local materialization are separate facts. Check `materialization.complete`, `omitted_files`, and `unavailable_files` before claiming a payload is local.",
+        "`results/manifest.json` may list a large text file under its stored `.gz` name with `encoding`, `logical_path`, `logical_bytes`, and `logical_sha256`: it travelled gzip-compressed and only the decoded file exists here, at its `logical_path`, matching `logical_sha256`. Its `.genome-manifest.json` record names the stored object under `transport`.",
         "Files under `_retained/` (manifest `retained_files`) are kept local bytes from an earlier snapshot; they are outside the current activation, so never cite them as activated evidence. Everything outside `_retained/` is exactly the active snapshot. `unavailable_files` entries flagged `retained` describe those leftovers too, and are excluded from every `materialization` count.",
         "",
         "Treat `lab/` as sequencing evidence, not interpretation. Validate `lab/lab_manifest.json` and `lab/_COMPLETE.json` before relying on it. Never upload donor-specific sequence, variants, genotypes, or findings to a network service without explicit informed permission.",
@@ -2779,12 +3016,37 @@ def normalize_file_record(record, *, relative):
         raise SystemExit(f"existing file SHA-256 is malformed: {relative}")
     if not isinstance(proof, str) or not proof:
         raise SystemExit(f"existing file proof is malformed: {relative}")
-    return {
+    normalized = {
         "size": size,
         "remote_sha1": remote_sha1,
         "sha256": sha256,
         "proof": proof,
     }
+    # Optional: the stored gzip object this decoded local file came from. It
+    # rides with the record when carried or retired so provenance is never lost.
+    transport = record.get("transport")
+    if transport is not None:
+        if (
+            not isinstance(transport, dict)
+            or set(transport) != {"encoding", "path", "bytes", "sha256", "remote_sha1"}
+            or transport["encoding"] != "gzip"
+            or isinstance(transport["bytes"], bool)
+            or not isinstance(transport["bytes"], int)
+            or transport["bytes"] < 0
+            or not isinstance(transport["sha256"], str)
+            or SHA256_RE.fullmatch(transport["sha256"]) is None
+            or (
+                transport["remote_sha1"] is not None
+                and (
+                    not isinstance(transport["remote_sha1"], str)
+                    or SHA1_RE.fullmatch(transport["remote_sha1"]) is None
+                )
+            )
+        ):
+            raise SystemExit(f"existing file transport record is malformed: {relative}")
+        canonical_managed_relative(transport["path"])
+        normalized["transport"] = dict(transport)
+    return normalized
 
 def audit_carried_file(relative, record):
     parsed = canonical_managed_relative(relative)
@@ -2838,28 +3100,68 @@ def audit_carried_file(relative, record):
 requested_sections = {only} if only else {"lab", "results", "ensemble"}
 if exclude:
     requested_sections.discard(exclude)
-verified = {}
-for line in open(verified_path, encoding="utf-8"):
-    remote_sha1, size, expected_sha256, _key, relative = line.rstrip("\n").split("\t")
-    if relative in verified:
-        raise SystemExit(f"duplicate verified remote path: {relative}")
-    verified[relative] = (int(size), remote_sha1, expected_sha256)
-remote = {}
-for line in open(filtered_path, encoding="utf-8"):
-    remote_sha1, size, expected_sha256, _key, relative = line.rstrip("\n").split("\t")
-    if relative in remote:
-        raise SystemExit(f"duplicate projected local path: {relative}")
-    remote[relative] = (int(size), remote_sha1, expected_sha256)
+
+def read_plan_rows(path, *, duplicate_label):
+    """Parse plan TSV rows keyed by local path (columns: see the plan writer)."""
+    rows = {}
+    for line in open(path, encoding="utf-8"):
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) != 8:
+            raise SystemExit(f"malformed plan row: {fields[4] if len(fields) > 4 else line!r}")
+        remote_sha1, size, expected_sha256, key, relative, encoding, logical_size, logical_sha256 = fields
+        if relative in rows:
+            raise SystemExit(f"{duplicate_label}: {relative}")
+        if encoding not in {"identity", "gzip"} or not key.startswith(donor + "/"):
+            raise SystemExit(f"malformed plan row: {relative}")
+        rows[relative] = {
+            "size": int(size),
+            "remote_sha1": None if remote_sha1 == "unverified" else remote_sha1,
+            "expected_sha256": expected_sha256,
+            "stored_path": key[len(donor) + 1 :],
+            "encoding": encoding,
+            "logical_size": int(logical_size),
+            "logical_sha256": logical_sha256,
+        }
+    return rows
+
+def local_identity(row):
+    """(size, remote SHA-1, SHA-256, transport) the local file at the row's path must
+    carry. A gzip row is installed decoded: its bytes match the logical identity, no
+    B2 object holds them (no remote SHA-1), and `transport` names the stored object."""
+    if row["encoding"] == "gzip":
+        return (
+            row["logical_size"],
+            None,
+            row["logical_sha256"],
+            {
+                "encoding": "gzip",
+                "path": row["stored_path"],
+                "bytes": row["size"],
+                "sha256": row["expected_sha256"],
+                "remote_sha1": row["remote_sha1"],
+            },
+        )
+    expected_sha256 = row["expected_sha256"]
+    return (
+        row["size"],
+        row["remote_sha1"],
+        None if expected_sha256 == "unbound" else expected_sha256,
+        None,
+    )
+
+verified = read_plan_rows(verified_path, duplicate_label="duplicate verified remote path")
+remote = read_plan_rows(filtered_path, duplicate_label="duplicate projected local path")
 omitted = {}
-for line in open(omitted_path, encoding="utf-8"):
-    remote_sha1, size, expected_sha256, _key, relative = line.rstrip("\n").split("\t")
-    if relative in omitted:
-        raise SystemExit(f"duplicate omitted remote path: {relative}")
+for relative, row in read_plan_rows(
+    omitted_path, duplicate_label="duplicate omitted remote path"
+).items():
+    size, remote_sha1, sha256, transport = local_identity(row)
     omitted[relative] = {
-        "size": int(size),
-        "remote_sha1": None if remote_sha1 == "unverified" else remote_sha1,
-        "sha256": None if expected_sha256 == "unbound" else expected_sha256,
+        "size": size,
+        "remote_sha1": remote_sha1,
+        "sha256": sha256,
         "reason": "user_deselected_large_payload",
+        **({"transport": transport} if transport is not None else {}),
     }
 if set(remote) & set(omitted) or set(verified) != set(remote) | set(omitted):
     raise SystemExit("selected and omitted rows do not partition the verified remote inventory")
@@ -2876,10 +3178,17 @@ for line in open(hashes_path, encoding="utf-8"):
     }
 if set(remote) != set(observed):
     raise SystemExit(f"manifest hash coverage differs from remote plan: missing={sorted(set(remote)-set(observed))[:5]}")
-for relative, (size, remote_sha1, _expected_sha256) in remote.items():
+for relative, row in remote.items():
     record = observed[relative]
-    if record["size"] != size or record["remote_sha1"] != (None if remote_sha1 == "unverified" else remote_sha1):
+    size, remote_sha1, sha256, transport = local_identity(row)
+    if (
+        record["size"] != size
+        or record["remote_sha1"] != remote_sha1
+        or (sha256 is not None and record["sha256"] != sha256)
+    ):
         raise SystemExit(f"manifest identity mismatch: {relative}")
+    if transport is not None:
+        record["transport"] = transport
 existing = {}
 existing_path = Path(existing_manifest_path)
 if existing_path.exists():

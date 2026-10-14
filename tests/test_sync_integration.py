@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
+import zlib
+from pathlib import Path
 
 import pexpect
 import pytest
@@ -638,3 +642,565 @@ def test_jobs_rejects_out_of_range_or_non_numeric(
     completed = _run(client, "sync", "--jobs", bad_jobs, "--yes")
     assert completed.returncode != 0
     assert "--jobs must be" in completed.stderr, completed.stderr + completed.stdout
+
+
+# --- donor-root-export-manifest/v4: gzip transport, plain files on disk ---------
+
+ASSAY = "shortread"
+ROOT_V3 = "donor-root-export-manifest/v3"
+ROOT_V4 = "donor-root-export-manifest/v4"
+RESULTS_ASSETS = {
+    "AGENTS.md": b"# Agent guide\n",
+    "CLAUDE.md": b"# Agent guide\n",
+    "README.md": b"# Results\n",
+}
+BIG_TSV = b"".join(
+    f"chr1\t{position}\tA\tG\t0.{position % 97:02d}\n".encode() for position in range(20000)
+)
+TABLE_JSON = json.dumps([{"gene": f"G{index}", "score": index / 7} for index in range(3000)]).encode()
+SUMMARY_JSON = b'{"rows": 20000}\n'
+# A stage output that is itself gzip bytes ships plain and must stay compressed.
+CALLS_VCF_GZ = gzip.compress(b"##fileformat=VCFv4.2\n#CHROM\tPOS\n", mtime=0)
+DROP = object()
+
+
+def _sha256(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _plain_text(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
+def _plain(path: str, content: bytes) -> tuple[dict[str, object], bytes]:
+    return {"path": path, "bytes": len(content), "sha256": _sha256(content)}, content
+
+
+def _encoded(
+    logical: str,
+    content: bytes,
+    *,
+    stored: bytes | None = None,
+    **overrides: object,
+) -> tuple[dict[str, object], bytes]:
+    """One v4 encoded object: bytes/sha256 describe the STORED gzip object (built
+    from `stored` when given, e.g. a damaged stream), logical_* the plain file.
+    `overrides` replace entry fields to build contract violations."""
+    stored_bytes = gzip.compress(content, compresslevel=6, mtime=0) if stored is None else stored
+    entry: dict[str, object] = {
+        "path": logical + ".gz",
+        "bytes": len(stored_bytes),
+        "sha256": _sha256(stored_bytes),
+        "encoding": "gzip",
+        "logical_path": logical,
+        "logical_bytes": len(content),
+        "logical_sha256": _sha256(content),
+    }
+    entry.update(overrides)
+    return entry, stored_bytes
+
+
+def _v4_objects(*, big: tuple[dict[str, object], bytes] | None = None) -> list:
+    return [
+        _encoded("stage_a/big.tsv", BIG_TSV) if big is None else big,
+        _plain("stage_a/calls.vcf.gz", CALLS_VCF_GZ),
+        _plain("stage_a/summary.json", SUMMARY_JSON),
+        _encoded("stage_b/table.json", TABLE_JSON),
+    ]
+
+
+def _selected_disposition(stage: str) -> dict[str, object]:
+    return {
+        "stage": stage,
+        "state": "selected",
+        "reason": "",
+        "attempt_id": "attempt-1",
+        "ran_at": "2026-10-01T00:00:00Z",
+        "current_pointer_sha256": "3" * 64,
+        "receipt_sha256": "4" * 64,
+        "currency": {
+            "decision_id": "5" * 64,
+            "disposition": "CURRENT",
+            "completion_eligible": True,
+            "produced_identity_digest": "6" * 64,
+            "current_identity_digest": "6" * 64,
+            "unresolved_reason_codes": [],
+            "semantic_judgment_id": "",
+            "currentness_attestation_id": "",
+            "identity_scheme": "execution_identity.v1",
+            "action_key": "",
+            "semantic_artifact_digest": "",
+        },
+        "blocked_by": "",
+        "evidence_kind": "cass_current",
+        "action_key": "",
+        "semantic_artifact_digest": "",
+    }
+
+
+def _write_results_snapshot(
+    client: FakeGenomeSync,
+    objects: list,
+    *,
+    schema: str = ROOT_V4,
+    published_at: str = "2026-10-01T00:00:00Z",
+    root_overrides: dict[str, object] | None = None,
+) -> None:
+    """Replace the fake remote results prefix with one activated snapshot: root
+    manifest, completion marker binding its stored object set, and the objects."""
+    entries = sorted(
+        [*objects, *(_plain(name, content) for name, content in RESULTS_ASSETS.items())],
+        key=lambda item: str(item[0]["path"]),
+    )
+    root: dict[str, object] = {
+        "schema_version": schema,
+        "sample_id": "sample-001",
+        "donor_id": client.donor,
+        "assay_id": ASSAY,
+        "selected_stages": ["stage_a"],
+        "objects": [entry for entry, _content in entries],
+        "object_count": len(entries),
+        "object_bytes": sum(int(entry["bytes"]) for entry, _content in entries),
+        "source_epoch_id": "7" * 64,
+        "revision_equivalence_evidence_sha256": "8" * 64,
+        "stage_dispositions": [_selected_disposition("stage_a")],
+    }
+    if schema == ROOT_V4:
+        root["transport_codec"] = {
+            "codec": "gzip",
+            "level": 6,
+            "zlib_runtime_version": zlib.ZLIB_RUNTIME_VERSION,
+        }
+    for key, value in (root_overrides or {}).items():
+        if value is DROP:
+            root.pop(key)
+        else:
+            root[key] = value
+    manifest_bytes = (json.dumps(root, indent=2, sort_keys=True) + "\n").encode()
+    object_set = sorted(
+        [
+            {"path": entry["path"], "bytes": entry["bytes"], "sha256": entry["sha256"]}
+            for entry, _content in entries
+        ]
+        + [{"path": "manifest.json", "bytes": len(manifest_bytes), "sha256": _sha256(manifest_bytes)}],
+        key=lambda item: str(item["path"]),
+    )
+    marker = {
+        "schema_version": "donor-results-completion/v3",
+        "sample_id": "sample-001",
+        "donor_id": client.donor,
+        "assay_id": ASSAY,
+        "plan_sha256": _sha256(manifest_bytes),
+        "destination": {
+            "sink": "b2",
+            "bucket": "computational-genomics",
+            "prefix": f"{client.donor}/{ASSAY}/results",
+            "representation": "flat",
+        },
+        "object_set_sha256": _sha256(
+            json.dumps(object_set, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        ),
+        "object_count": len(object_set),
+        "object_bytes": sum(int(item["bytes"]) for item in object_set),
+        "published_at": published_at,
+    }
+    files = {str(entry["path"]): content for entry, content in entries}
+    files["manifest.json"] = manifest_bytes
+    files["_COMPLETE.json"] = (json.dumps(marker, sort_keys=True) + "\n").encode()
+    results_root = Path(client.environment["FAKE_B2_ROOT"]) / client.donor / ASSAY / "results"
+    shutil.rmtree(results_root, ignore_errors=True)
+    for relative, content in files.items():
+        target = results_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+
+
+def _sync_results(
+    client: FakeGenomeSync,
+    *arguments: str,
+    environment: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            client.command,
+            "--dest",
+            str(client.destination),
+            "--only",
+            "results",
+            "--yes",
+            *arguments,
+            client.donor,
+        ],
+        env=client.environment if environment is None else environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _no_transport_downloads(client: FakeGenomeSync) -> dict[str, str]:
+    """Environment under which fetching any .gz object fails the sync."""
+    return {**client.environment, "FAKE_B2_FAIL_DOWNLOAD_SUFFIX": ".gz"}
+
+
+def _results_dir(client: FakeGenomeSync) -> Path:
+    return client.destination / ASSAY / "results"
+
+
+def _assert_no_temp_left(client: FakeGenomeSync) -> None:
+    assert not list(client.destination.glob(".genome-download-tmp.*"))
+
+
+@pytest.mark.parametrize("jobs", ["1", "4"])
+def test_v4_package_installs_plain_files_at_logical_paths(
+    fake_genome_sync: FakeGenomeSync,
+    jobs: str,
+) -> None:
+    client = fake_genome_sync
+    _write_results_snapshot(client, _v4_objects())
+
+    completed = _sync_results(client, "--jobs", jobs)
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    results = _results_dir(client)
+    for logical_path, content in (("stage_a/big.tsv", BIG_TSV), ("stage_b/table.json", TABLE_JSON)):
+        assert (results / logical_path).read_bytes() == content
+        assert not (results / f"{logical_path}.gz").exists()
+    # A plain object that happens to be gzip bytes is installed exactly as shipped.
+    assert (results / "stage_a/calls.vcf.gz").read_bytes() == CALLS_VCF_GZ
+    _assert_no_temp_left(client)
+
+    manifest = _manifest(client)
+    assert manifest["schema"] == 6
+    assert manifest["materialization"]["complete"] is True
+    stored = gzip.compress(BIG_TSV, compresslevel=6, mtime=0)
+    assert manifest["files"][f"{ASSAY}/results/stage_a/big.tsv"] == {
+        "size": len(BIG_TSV),
+        "sha256": _sha256(BIG_TSV),
+        "remote_sha1": None,
+        "proof": "activated_plan_gzip_decoded_sha256_verified",
+        "transport": {
+            "encoding": "gzip",
+            "path": f"{ASSAY}/results/stage_a/big.tsv.gz",
+            "bytes": len(stored),
+            "sha256": _sha256(stored),
+            "remote_sha1": hashlib.sha1(stored, usedforsecurity=False).hexdigest(),
+        },
+    }
+    assert not any(path.endswith(("big.tsv.gz", "table.json.gz")) for path in manifest["files"])
+    plain_record = manifest["files"][f"{ASSAY}/results/stage_a/calls.vcf.gz"]
+    assert "transport" not in plain_record
+    assert plain_record["sha256"] == _sha256(CALLS_VCF_GZ)
+    assert plain_record["proof"] == "activated_plan_sha256_verified"
+    log = (Path(client.environment["XDG_STATE_HOME"]) / "genome-sync" / "sync.log").read_text()
+    assert f"file decode encoding=gzip stored_bytes={len(stored)} logical_bytes={len(BIG_TSV)}" in log
+    assert "proof=activated_plan_gzip_decoded_sha256_verified" in log
+
+
+def test_v4_second_sync_and_relocation_reuse_without_downloading(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _write_results_snapshot(client, _v4_objects())
+    first = _sync_results(client)
+    assert first.returncode == 0, first.stderr + first.stdout
+
+    repeated = _sync_results(client, environment=_no_transport_downloads(client))
+    assert repeated.returncode == 0, repeated.stderr + repeated.stdout
+    assert "0 new · 0 updated" in _plain_text(repeated.stdout)
+    record = _manifest(client)["files"][f"{ASSAY}/results/stage_a/big.tsv"]
+    assert record["proof"] == "activated_plan_logical_sha256_verified"
+    assert record["sha256"] == _sha256(BIG_TSV)
+    assert record["transport"]["path"] == f"{ASSAY}/results/stage_a/big.tsv.gz"
+
+    # A snapshot that moves the file is served from the local decoded bytes.
+    relocated = [_encoded("stage_c/big.tsv", BIG_TSV), *_v4_objects()[1:]]
+    _write_results_snapshot(client, relocated, published_at="2026-10-02T00:00:00Z")
+    moved = _sync_results(client, environment=_no_transport_downloads(client))
+    assert moved.returncode == 0, moved.stderr + moved.stdout
+    assert "1 reused locally" in _plain_text(moved.stdout)
+    results = _results_dir(client)
+    assert (results / "stage_c/big.tsv").read_bytes() == BIG_TSV
+    assert not (results / "stage_c/big.tsv.gz").exists()
+    manifest = _manifest(client)
+    moved_record = manifest["files"][f"{ASSAY}/results/stage_c/big.tsv"]
+    assert moved_record["proof"] == "activated_plan_logical_sha256_verified"
+    assert moved_record["transport"]["path"] == f"{ASSAY}/results/stage_c/big.tsv.gz"
+    retired = manifest["retained_files"][f"_retained/{ASSAY}/results/stage_a/big.tsv"]
+    assert retired["transport"]["path"] == f"{ASSAY}/results/stage_a/big.tsv.gz"
+
+
+def test_v4_dropped_encoded_file_is_retired_to_attic_and_restored(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _write_results_snapshot(client, _v4_objects())
+    assert _sync_results(client).returncode == 0
+
+    dropped = [item for item in _v4_objects() if item[0]["path"] != "stage_a/big.tsv.gz"]
+    _write_results_snapshot(client, dropped, published_at="2026-10-02T00:00:00Z")
+    retired = _sync_results(client)
+    assert retired.returncode == 0, retired.stderr + retired.stdout
+    assert "1 to retire to _retained/" in _plain_text(retired.stdout)
+    live = _results_dir(client) / "stage_a/big.tsv"
+    attic = client.destination / "_retained" / ASSAY / "results/stage_a/big.tsv"
+    assert not live.exists()
+    assert attic.read_bytes() == BIG_TSV
+    assert not list(client.destination.rglob("big.tsv.gz"))
+
+    manifest = _manifest(client)
+    record = manifest["retained_files"][f"_retained/{ASSAY}/results/stage_a/big.tsv"]
+    assert record["original_path"] == f"{ASSAY}/results/stage_a/big.tsv"
+    assert record["reason"] == "absent_from_active_snapshot"
+    assert record["size"] == len(BIG_TSV)
+    assert record["sha256"] == _sha256(BIG_TSV)
+    assert record["transport"]["path"] == f"{ASSAY}/results/stage_a/big.tsv.gz"
+    assert f"{ASSAY}/results/stage_a/big.tsv" not in manifest["files"]
+    assert manifest["materialization"]["complete"] is True
+
+    _write_results_snapshot(client, _v4_objects(), published_at="2026-10-03T00:00:00Z")
+    restored = _sync_results(client, environment=_no_transport_downloads(client))
+    assert restored.returncode == 0, restored.stderr + restored.stdout
+    assert "reused locally" in _plain_text(restored.stdout)
+    assert live.read_bytes() == BIG_TSV
+
+
+def test_v4_wrong_logical_sha256_fails_closed_and_keeps_existing_files(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _write_results_snapshot(client, _v4_objects())
+    assert _sync_results(client).returncode == 0
+    local_manifest = client.destination / ".genome-manifest.json"
+    manifest_before = local_manifest.read_bytes()
+    results = _results_dir(client)
+    payloads_before = {
+        path: (results / path).read_bytes()
+        for path in ("stage_a/big.tsv", "stage_a/summary.json", "stage_b/table.json")
+    }
+
+    changed = BIG_TSV + b"chr2\t1\tC\tT\t0.10\n"
+    lying = _encoded("stage_a/big.tsv", changed, logical_sha256=_sha256(b"not the content"))
+    _write_results_snapshot(
+        client, _v4_objects(big=lying), published_at="2026-10-02T00:00:00Z"
+    )
+    failed = _sync_results(client)
+    assert failed.returncode == 1
+    assert (
+        f"decoded SHA-256 violates activated plan for {ASSAY}/results/stage_a/big.tsv"
+        in _plain_text(failed.stdout)
+    ), failed.stdout + failed.stderr
+    for path, content in payloads_before.items():
+        assert (results / path).read_bytes() == content, path
+    assert not (results / "stage_a/big.tsv.gz").exists()
+    assert local_manifest.read_bytes() == manifest_before
+    _assert_no_temp_left(client)
+
+
+@pytest.mark.parametrize(
+    ("label", "big", "stderr_fragment"),
+    [
+        (
+            "decodes beyond logical_bytes",
+            _encoded("stage_a/big.tsv", BIG_TSV, logical_bytes=len(BIG_TSV) - 1),
+            "exceeds the activated logical size",
+        ),
+        (
+            "truncated stream",
+            _encoded(
+                "stage_a/big.tsv",
+                BIG_TSV,
+                stored=gzip.compress(BIG_TSV, compresslevel=6, mtime=0)[:400],
+            ),
+            "not a valid gzip stream",
+        ),
+        (
+            "corrupt CRC trailer",
+            _encoded(
+                "stage_a/big.tsv",
+                BIG_TSV,
+                stored=(lambda data: data[:-8] + bytes([data[-8] ^ 0xFF]) + data[-7:])(
+                    gzip.compress(BIG_TSV, compresslevel=6, mtime=0)
+                ),
+            ),
+            "not a valid gzip stream",
+        ),
+    ],
+)
+def test_v4_bad_transport_stream_fails_closed_at_decode(
+    fake_genome_sync: FakeGenomeSync,
+    label: str,
+    big: tuple[dict[str, object], bytes],
+    stderr_fragment: str,
+) -> None:
+    # The manifest's stored digest is built from these exact bytes, so download
+    # verification passes and only the decode can catch the defect.
+    client = fake_genome_sync
+    _write_results_snapshot(client, _v4_objects(big=big))
+
+    failed = _sync_results(client)
+    assert failed.returncode == 1, label
+    assert (
+        f"gzip transport object failed to decode for {ASSAY}/results/stage_a/big.tsv"
+        in _plain_text(failed.stdout)
+    ), failed.stdout + failed.stderr
+    assert stderr_fragment in failed.stderr, failed.stderr
+    assert not (_results_dir(client) / "stage_a/big.tsv").exists()
+    assert not (_results_dir(client) / "stage_a/big.tsv.gz").exists()
+    assert not (client.destination / ".genome-manifest.json").exists()
+    _assert_no_temp_left(client)
+
+
+def test_v3_package_still_syncs_unchanged(fake_genome_sync: FakeGenomeSync) -> None:
+    client = fake_genome_sync
+    objects = [
+        _plain("stage_a/big.tsv", BIG_TSV),
+        _plain("stage_a/calls.vcf.gz", CALLS_VCF_GZ),
+        _plain("stage_a/summary.json", SUMMARY_JSON),
+    ]
+    _write_results_snapshot(client, objects, schema=ROOT_V3)
+
+    completed = _sync_results(client)
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    results = _results_dir(client)
+    manifest = _manifest(client)
+    for path, content in (
+        ("stage_a/big.tsv", BIG_TSV),
+        ("stage_a/calls.vcf.gz", CALLS_VCF_GZ),
+        ("stage_a/summary.json", SUMMARY_JSON),
+    ):
+        assert (results / path).read_bytes() == content
+        assert manifest["files"][f"{ASSAY}/results/{path}"] == {
+            "size": len(content),
+            "sha256": _sha256(content),
+            "remote_sha1": hashlib.sha1(content, usedforsecurity=False).hexdigest(),
+            "proof": "activated_plan_sha256_verified",
+        }
+    assert not any("transport" in record for record in manifest["files"].values())
+    for asset, content in RESULTS_ASSETS.items():
+        assert (client.destination / asset).read_bytes() == content
+
+
+@pytest.mark.parametrize(
+    ("objects", "schema", "stderr_fragment"),
+    [
+        (
+            [_plain("stage_a/big.tsv", BIG_TSV), _encoded("stage_a/big.tsv", BIG_TSV)],
+            ROOT_V4,
+            "results logical path collides with another object",
+        ),
+        (
+            [_encoded("stage_a/x", b"x" * 100), _encoded("stage_a/x.gz", b"y" * 100)],
+            ROOT_V4,
+            "results logical path collides with another object",
+        ),
+        (
+            [_encoded("stage_a/big.tsv", BIG_TSV, logical_path="stage_a/other.tsv")],
+            ROOT_V4,
+            "transport path is not its logical path plus .gz",
+        ),
+        (
+            [_encoded("manifest.json", b"{}" * 50)],
+            ROOT_V4,
+            "encodes a reserved name",
+        ),
+        (
+            [_encoded("stage_a/big.tsv", BIG_TSV, encoding="zstd")],
+            ROOT_V4,
+            "unsupported transport encoding",
+        ),
+        (
+            [_encoded("stage_a/big.tsv", BIG_TSV)],
+            ROOT_V3,
+            "results root manifest object has an unexpected schema",
+        ),
+    ],
+    ids=[
+        "plain-object-at-logical-path",
+        "logical-path-names-stored-object",
+        "path-not-logical-plus-gz",
+        "reserved-name-encoded",
+        "unsupported-encoding",
+        "encoded-object-in-v3",
+    ],
+)
+def test_v4_transport_invariant_violations_are_rejected(
+    fake_genome_sync: FakeGenomeSync,
+    objects: list,
+    schema: str,
+    stderr_fragment: str,
+) -> None:
+    client = fake_genome_sync
+    _write_results_snapshot(client, objects, schema=schema)
+
+    failed = _sync_results(client)
+    assert failed.returncode == 1
+    assert "violated the donor contract" in _plain_text(failed.stdout)
+    assert stderr_fragment in failed.stderr, failed.stderr
+    assert not (client.destination / ASSAY).exists()
+    assert not (client.destination / ".genome-manifest.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("transport_codec", "stderr_fragment"),
+    [
+        (DROP, "results root manifest has an unexpected schema"),
+        ({"codec": "zstd", "level": 3}, "transport codec is not gzip"),
+    ],
+    ids=["missing", "not-gzip"],
+)
+def test_v4_requires_a_gzip_transport_codec(
+    fake_genome_sync: FakeGenomeSync,
+    transport_codec: object,
+    stderr_fragment: str,
+) -> None:
+    client = fake_genome_sync
+    _write_results_snapshot(
+        client, _v4_objects(), root_overrides={"transport_codec": transport_codec}
+    )
+
+    failed = _sync_results(client)
+    assert failed.returncode == 1
+    assert "violated the donor contract" in _plain_text(failed.stdout)
+    assert stderr_fragment in failed.stderr, failed.stderr
+    assert not (client.destination / ".genome-manifest.json").exists()
+
+
+def _system_python3_older_than_310() -> str | None:
+    """The engine runs embedded Python on the donor's first python3; on macOS that
+    can be the stock /usr/bin/python3 (3.9). Return it when it is pre-3.10."""
+    candidate = Path("/usr/bin/python3")
+    if not candidate.exists():
+        return None
+    probe = subprocess.run(
+        [str(candidate), "-c", "import sys; print(sys.version_info < (3, 10))"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return str(candidate) if probe.stdout.strip() == "True" else None
+
+
+def test_repeat_v4_sync_runs_on_a_pre_310_system_python3(
+    fake_genome_sync: FakeGenomeSync,
+    tmp_path: Path,
+) -> None:
+    # Regression: an unquoted `str | None` annotation in the local-index step made
+    # every repeat sync into a non-empty folder die with TypeError on Python 3.9.
+    stock = _system_python3_older_than_310()
+    if stock is None:
+        pytest.skip("no pre-3.10 system python3 on this machine")
+    client = fake_genome_sync
+    shim = tmp_path / "stock-python"
+    shim.mkdir()
+    (shim / "python3").symlink_to(stock)
+    environment = {
+        **client.environment,
+        "PATH": f"{shim}{os.pathsep}{client.environment['PATH']}",
+    }
+    _write_results_snapshot(client, _v4_objects())
+    first = _sync_results(client, environment=environment)
+    assert first.returncode == 0, first.stderr + first.stdout
+    repeated = _sync_results(client, environment=environment)
+    assert repeated.returncode == 0, repeated.stderr + repeated.stdout
+    assert "0 new · 0 updated" in _plain_text(repeated.stdout)
+    assert (_results_dir(client) / "stage_a/big.tsv").read_bytes() == BIG_TSV
