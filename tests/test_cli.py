@@ -117,6 +117,33 @@ def test_console_preserves_bash_exit_code() -> None:
     assert "unknown option" in completed.stderr
 
 
+def test_console_hands_its_interpreter_to_the_engine(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_bash = fake_bin / "bash"
+    fake_bash.write_text(
+        "#!/usr/bin/python3\nimport os\nprint(os.environ.get('GENOME_SYNC_PYTHON', ''))\n",
+        encoding="utf-8",
+    )
+    fake_bash.chmod(0o700)
+    command = Path(os.environ["VIRTUAL_ENV"]) / "bin" / "genome-sync"
+    environment = os.environ.copy()
+    environment["PATH"] = str(fake_bin)
+    environment.pop("GENOME_SYNC_PYTHON", None)
+    completed = subprocess.run(
+        [command, "--help"], env=environment, text=True, capture_output=True, check=True
+    )
+    handed = Path(completed.stdout.strip())
+    assert handed.is_file()
+    version = subprocess.run(
+        [handed, "-c", "import sys; print(sys.version_info >= (3, 10))"],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert version.stdout.strip() == "True"
+
+
 def test_console_process_receives_signals_after_exec(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()

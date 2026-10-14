@@ -26,6 +26,10 @@ from typing import NoReturn
 # Rollback is `git branch -f released <good-sha>`, with no new code.
 SOURCE = "git+https://github.com/markusstrasser/genome-sync@released"
 DISABLE_VARIABLE = "GENOME_SYNC_NO_SELF_UPDATE"
+# The engine's embedded Python runs on this interpreter: the one uv resolved for the
+# package (requires-python >= 3.10). Without it the engine falls back to the donor's
+# first `python3`, which on stock macOS is 3.9 and broke repeat syncs (2026-10-14).
+INTERPRETER_VARIABLE = "GENOME_SYNC_PYTHON"
 REFRESH_TIMEOUT_SECONDS = 60
 
 
@@ -88,6 +92,7 @@ def main() -> NoReturn:
         if not script_path.is_file():
             print(f"error: bundled client is missing: {script_path}", file=sys.stderr)
             raise SystemExit(127)
+        os.environ[INTERPRETER_VARIABLE] = sys.executable
         os.execv(bash, [bash, str(script_path), *arguments])
 
     raise AssertionError("os.execv returned unexpectedly")

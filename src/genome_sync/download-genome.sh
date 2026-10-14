@@ -145,9 +145,15 @@ if [ "$COMMAND" != "one-off" ] && [ "$COMMAND" != "destination" ] \
   exit 1
 fi
 PY=()
-for candidate in python3 python; do
-  if command -v "$candidate" >/dev/null 2>&1; then PY=("$candidate"); break; fi
-done
+# The console entry point passes the interpreter uv resolved for the package, so the
+# embedded Python never depends on the donor's own python3 (stock macOS ships 3.9).
+if [ -n "${GENOME_SYNC_PYTHON:-}" ] && [ -x "${GENOME_SYNC_PYTHON}" ]; then
+  PY=("$GENOME_SYNC_PYTHON")
+else
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then PY=("$candidate"); break; fi
+  done
+fi
 [ "${#PY[@]}" -eq 0 ] && PY=(uv run --no-project python3)
 
 CONFIG_ROOT="${XDG_CONFIG_HOME:-${HOME:?HOME is required}/.config}/genome-sync"
