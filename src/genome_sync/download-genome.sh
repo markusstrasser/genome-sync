@@ -586,6 +586,19 @@ def validate_relative(value):
         fail("relative path is not canonical")
     return path.parts
 
+def open_directory(name, dir_fd):
+    # O_NOFOLLOW alone is not enough: gVisor opens a symlink when O_DIRECTORY is also set
+    # (Modal probe 2026-10-14). Check the entry itself, then the identity of what opened.
+    observed = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(observed.st_mode):
+        raise NotADirectoryError(errno.ENOTDIR, "not a real directory", name)
+    child_fd = os.open(name, flags, dir_fd=dir_fd)
+    opened = os.fstat(child_fd)
+    if (opened.st_dev, opened.st_ino) != (observed.st_dev, observed.st_ino):
+        os.close(child_fd)
+        raise NotADirectoryError(errno.ENOTDIR, "directory changed while opening", name)
+    return child_fd
+
 def open_root(create=False):
     if not root.is_absolute():
         fail("destination root is not absolute")
@@ -598,7 +611,7 @@ def open_root(create=False):
                 except FileExistsError:
                     pass
             try:
-                child_fd = os.open(part, flags, dir_fd=current_fd)
+                child_fd = open_directory(part, current_fd)
             except OSError as error:
                 fail(f"destination ancestor is not a real directory: {part}: {error}")
             os.close(current_fd)
@@ -622,7 +635,7 @@ def open_parent(relative, create=False):
                     os.mkdir(part, mode=0o700, dir_fd=parent_fd)
                 except FileExistsError:
                     pass
-            child_fd = os.open(part, flags, dir_fd=parent_fd)
+            child_fd = open_directory(part, parent_fd)
             os.close(parent_fd)
             parent_fd = child_fd
         return parent_fd, parts[-1]
@@ -645,7 +658,7 @@ def validate_tree(directory_fd, display):
             fail(f"symlink found inside destination: {display_path}")
         if stat.S_ISDIR(observed.st_mode):
             try:
-                child_fd = os.open(name, flags, dir_fd=directory_fd)
+                child_fd = open_directory(name, directory_fd)
             except OSError as error:
                 fail(f"destination directory changed during validation at {display_path}: {error}")
             try:
