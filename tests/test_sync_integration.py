@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import gzip
 import hashlib
 import json
@@ -339,6 +340,115 @@ def test_repeated_setup_prefills_and_commits_only_after_confirmation(
     assert updated["schema_version"] == "genome-sync-config/v4"
     assert updated["destination"] == str(client.destination)
     assert updated["only"] == "lab"
+
+
+def _first_setup_destination(
+    client: FakeGenomeSync,
+    probes: dict[str, str] | None = None,
+    **variables: str,
+) -> Path:
+    """Dry-run a first `setup --yes` without --dest, with `probes` (executable
+    name -> script) first on PATH, and return the destination it would use."""
+    probe_bin = client.destination.parent / "os-probes"
+    probe_bin.mkdir(exist_ok=True)
+    for name, script in (probes or {}).items():
+        probe = probe_bin / name
+        probe.write_text(script, encoding="utf-8")
+        probe.chmod(0o755)
+    environment = dict(client.environment, **variables)
+    environment.pop("XDG_DOWNLOAD_DIR", None)
+    environment["PATH"] = f"{probe_bin}{os.pathsep}{environment['PATH']}"
+    probed = dataclasses.replace(client, environment=environment)
+    completed = _run(probed, "setup", "--only", "lab", "--yes", "--dry-run", client.donor)
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    found = re.search(r"^\s*Destination: (.+)$", completed.stdout, re.MULTILINE)
+    assert found, completed.stdout
+    return Path(found.group(1))
+
+
+@pytest.mark.parametrize("has_downloads", [True, False])
+def test_first_setup_suggests_the_downloads_folder_else_home(
+    fake_genome_sync: FakeGenomeSync,
+    has_downloads: bool,
+) -> None:
+    # The host's own branch (Darwin here): <Downloads>/<donor>-genome when the
+    # folder exists, ~/<donor>-genome on a machine without one.
+    client = fake_genome_sync
+    home = Path(client.environment["HOME"])
+    if has_downloads:
+        (home / "Downloads").mkdir()
+    expected_parent = home / "Downloads" if has_downloads else home
+    assert _first_setup_destination(client) == expected_parent / f"{client.donor}-genome"
+
+
+@pytest.mark.parametrize("source", ["user-dirs.dirs", "xdg-user-dir"])
+def test_first_setup_on_linux_follows_a_relocated_xdg_download_folder(
+    fake_genome_sync: FakeGenomeSync,
+    source: str,
+) -> None:
+    client = fake_genome_sync
+    home = Path(client.environment["HOME"])
+    (home / "Downloads").mkdir()
+    relocated = home / "Relocated Downloads"
+    relocated.mkdir()
+    elsewhere = client.destination.parent / "elsewhere" / "Downloads"
+    elsewhere.mkdir(parents=True)
+    user_dirs = Path(client.environment["XDG_CONFIG_HOME"]) / "user-dirs.dirs"
+    user_dirs.parent.mkdir(parents=True, exist_ok=True)
+    user_dirs.write_text(
+        "# written by xdg-user-dirs-update\n"
+        'XDG_DESKTOP_DIR="$HOME/Desktop"\n'
+        'XDG_DOWNLOAD_DIR="$HOME/Relocated Downloads"\n',
+        encoding="utf-8",
+    )
+    # xdg-user-dir answers $HOME itself when it has no folder, which must fall
+    # through to user-dirs.dirs; a real answer outranks the file.
+    answer = '"$HOME"' if source == "user-dirs.dirs" else f"'{elsewhere}'"
+    probes = {
+        "uname": "#!/bin/sh\necho Linux\n",
+        "xdg-user-dir": f"#!/bin/sh\nprintf '%s\\n' {answer}\n",
+    }
+    expected_parent = relocated if source == "user-dirs.dirs" else elsewhere
+    assert _first_setup_destination(client, probes) == expected_parent / f"{client.donor}-genome"
+
+
+@pytest.mark.parametrize("known_folder_answers", [True, False])
+def test_first_setup_on_windows_asks_for_the_downloads_known_folder(
+    fake_genome_sync: FakeGenomeSync,
+    known_folder_answers: bool,
+) -> None:
+    client = fake_genome_sync
+    drives = client.destination.parent / "drives"
+    known_folder = drives / "d" / "Data" / "Downloads"
+    profile_downloads = drives / "c" / "Users" / "tester" / "Downloads"
+    known_folder.mkdir(parents=True)
+    profile_downloads.mkdir(parents=True)
+    # PowerShell answers with CRLF; a carriage return reaching cygpath is a bug.
+    powershell = (
+        "#!/usr/bin/env python3\nimport sys\n"
+        "if \"shell:Downloads\" not in \" \".join(sys.argv[1:]):\n"
+        "    raise SystemExit(2)\n"
+        + (
+            "sys.stdout.write('D:\\\\Data\\\\Downloads\\r\\n')\n"
+            if known_folder_answers
+            else "sys.exit('COM object unavailable')\n"
+        )
+    )
+    cygpath = (
+        "#!/usr/bin/env python3\nimport sys\n"
+        "flag, path = sys.argv[1:]\n"
+        "if flag != '-u' or '\\r' in path or path[1:3] != ':\\\\':\n"
+        "    sys.exit(f'fake cygpath refused {sys.argv[1:]!r}')\n"
+        "print('@DRIVES@/' + path[0].lower() + '/' + path[3:].replace('\\\\', '/'))\n"
+    ).replace("@DRIVES@", str(drives))
+    probes = {
+        "uname": "#!/bin/sh\necho MINGW64_NT-10.0-19045\n",
+        "powershell.exe": powershell,
+        "cygpath": cygpath,
+    }
+    chosen = _first_setup_destination(client, probes, USERPROFILE="C:\\Users\\tester")
+    expected_parent = known_folder if known_folder_answers else profile_downloads
+    assert chosen == expected_parent / f"{client.donor}-genome"
 
 
 def test_repeated_setup_failure_preserves_saved_configuration(

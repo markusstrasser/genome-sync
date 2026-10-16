@@ -32,7 +32,9 @@ ARGUMENTS:
   donor          your registered donor id (for example syn3); setup only
 
 OPTIONS:
-  -d, --dest DIR       setup destination (suggested: ~/Genome/<donor>)
+  -d, --dest DIR       setup destination (suggested: <donor>-genome in the
+                       operating system's Downloads folder, else in your home
+                       folder)
       --only WHICH     sync only one of: lab | results | ensemble
       --exclude WHICH  skip one of: lab | results | ensemble
       --prune          delete previously managed files that are absent from the
@@ -555,6 +557,66 @@ confirm() {
   return 0
 }
 
+# The operating system's own Downloads folder, used only for the first-time setup
+# suggestion. Each probe may be missing or fail; a failure falls through to the
+# next one, and the answer is always an existing absolute directory, with $HOME
+# as the last resort (a headless box has no Downloads folder).
+downloads_folder() {
+  local home="${HOME:-}" system="" known="" candidate="" user_dirs="" line=""
+  [ -n "$home" ] || { printf '.\n'; return 0; }
+  system="$(uname -s 2>/dev/null)" || system=""
+  case "$system" in
+    Darwin)
+      candidate="${home}/Downloads"
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      # Windows keeps the Downloads known folder in the registry; donors may have
+      # moved it to another drive or into OneDrive.
+      known="$(powershell.exe -NoProfile -Command \
+        "(New-Object -ComObject Shell.Application).NameSpace('shell:Downloads').Self.Path" \
+        < /dev/null 2> /dev/null)" || known=""
+      known="${known//$'\r'/}"
+      if [ -n "$known" ]; then
+        candidate="$(cygpath -u "$known" 2> /dev/null)" || candidate=""
+      fi
+      if [ -z "$candidate" ] && [ -n "${USERPROFILE:-}" ]; then
+        candidate="$(cygpath -u "${USERPROFILE}\\Downloads" 2> /dev/null)" || candidate=""
+      fi
+      ;;
+    *)
+      # XDG desktops: xdg-user-dir answers $HOME itself when no folder is set.
+      if command -v xdg-user-dir > /dev/null 2>&1; then
+        candidate="$(xdg-user-dir DOWNLOAD 2> /dev/null)" || candidate=""
+        [ "${candidate%/}" = "$home" ] && candidate=""
+      fi
+      user_dirs="${XDG_CONFIG_HOME:-${home}/.config}/user-dirs.dirs"
+      if [ -z "$candidate" ] && [ -f "$user_dirs" ] && [ -r "$user_dirs" ]; then
+        # Written as XDG_DOWNLOAD_DIR="$HOME/relative" or ="/absolute"; parsed,
+        # never sourced. The last assignment wins, as it would for the shell.
+        while IFS= read -r line || [ -n "$line" ]; do
+          case "$line" in
+            XDG_DOWNLOAD_DIR=*)
+              line="${line#XDG_DOWNLOAD_DIR=}"
+              line="${line#\"}"
+              line="${line%\"}"
+              case "$line" in
+                \$HOME|\$HOME/*) line="${home}${line#\$HOME}" ;;
+              esac
+              candidate="$line"
+              ;;
+          esac
+        done < "$user_dirs"
+      fi
+      ;;
+  esac
+  [ -n "$candidate" ] || candidate="${home}/Downloads"
+  candidate="${candidate%/}"
+  case "$candidate" in
+    /*) [ -d "$candidate" ] && { printf '%s\n' "$candidate"; return 0; } ;;
+  esac
+  printf '%s\n' "$home"
+}
+
 # All destination operations go through one no-follow dirfd guard. The root is
 # lexical (never realpath-resolved through a symlink), and every existing path
 # component must be a real directory or regular file as appropriate.
@@ -984,7 +1046,7 @@ if [ "$DEST_EXPLICIT" -eq 0 ]; then
     if [ "$SETUP_REPEATED" -eq 1 ]; then
       suggested_destination="$configured_destination"
     else
-      suggested_destination="${HOME}/Genome/${DONOR}"
+      suggested_destination="$(downloads_folder)/${DONOR}-genome"
     fi
     DEST="$suggested_destination"
     if [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then

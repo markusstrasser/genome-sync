@@ -18,7 +18,7 @@ updated.
 ```bash
 B2_APPLICATION_KEY_ID=... B2_APPLICATION_KEY=... \
   uvx --from git+https://github.com/markusstrasser/genome-sync@released \
-  genome-sync --dest ~/Genome/donor-id donor-id --dry-run
+  genome-sync --dest ~/Downloads/donor-id-genome donor-id --dry-run
 ```
 
 Drop `--dry-run` to write. That is the whole client — no install step, no
@@ -66,6 +66,13 @@ never configured still states what it is about to download rather than assuming
 it. Automation passes `--only` / `--exclude`, or `--yes` to take the saved
 answer unprompted.
 
+Setup also asks where to save the data. A first setup suggests
+`<donor>-genome` inside the operating system's own Downloads folder: macOS
+`~/Downloads`, the Windows Downloads known folder (which may have been moved to
+another drive or OneDrive), or the XDG download directory on Linux. When that
+folder does not exist, as on a headless machine, it suggests
+`~/<donor>-genome`. A repeated setup suggests the saved destination.
+
 The selected sections are downloaded whole. There is no per-file picking: a
 donor either has a section or does not.
 
@@ -79,7 +86,7 @@ bytes and names the stored object under `transport`.
 
 ```bash
 genome-sync sync --only results --yes
-genome-sync --dest ~/Genome/donor-id donor-id      # asks results / lab / both
+genome-sync --dest ~/Downloads/donor-id-genome donor-id      # asks results / lab / both
 ```
 
 `.genome-manifest.json` schema 6 separates the validated remote activation from
