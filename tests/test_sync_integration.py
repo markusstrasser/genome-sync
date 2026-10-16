@@ -451,6 +451,61 @@ def test_first_setup_on_windows_asks_for_the_downloads_known_folder(
     assert chosen == expected_parent / f"{client.donor}-genome"
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+@pytest.mark.parametrize(
+    "mode",
+    [
+        # Creating the destination inside a read-only Downloads fails at mkdir.
+        pytest.param(0o500, id="read-only-downloads"),
+        # Opening Downloads itself fails, as it does after a macOS privacy denial.
+        pytest.param(0o000, id="unreadable-downloads"),
+    ],
+)
+def test_denied_destination_explains_itself_without_a_traceback(
+    fake_genome_sync: FakeGenomeSync,
+    mode: int,
+) -> None:
+    client = fake_genome_sync
+    downloads = Path(client.environment["HOME"]) / "Downloads"
+    downloads.mkdir()
+    destination = downloads / f"{client.donor}-genome"
+    downloads.chmod(mode)
+    try:
+        completed = _run(client, "setup", "--only", "lab", "--yes", client.donor)
+    finally:
+        downloads.chmod(0o700)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, output
+    assert f"genome-sync could not create {destination}: permission denied." in completed.stderr
+    assert (
+        f"or choose another folder: genome-sync setup --dest DIR {client.donor}"
+        in completed.stderr
+    )
+    assert "Traceback" not in output
+    assert "unsafe recipient path" not in output
+    assert not destination.exists()
+
+
+def test_symlinked_destination_ancestor_is_still_refused_as_unsafe(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    real = client.destination.parent / "real"
+    real.mkdir()
+    link = client.destination.parent / "link"
+    link.symlink_to(real, target_is_directory=True)
+    completed = _run(
+        client, "setup", "--dest", str(link / "genome"), "--only", "lab", "--yes", client.donor
+    )
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert (
+        "unsafe recipient path: destination ancestor is not a real directory: link"
+        in completed.stderr
+    )
+    assert "permission denied" not in completed.stderr
+    assert not (real / "genome").exists()
+
+
 def test_repeated_setup_failure_preserves_saved_configuration(
     fake_genome_sync: FakeGenomeSync,
 ) -> None:

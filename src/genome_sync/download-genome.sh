@@ -623,7 +623,7 @@ downloads_folder() {
 fs_guard() {
   local operation="$1"
   shift
-  "${PY[@]}" - "$operation" "$DEST_ABS" "$@" <<'PYEOF'
+  "${PY[@]}" - "$operation" "$DEST_ABS" "$DONOR" "$@" <<'PYEOF'
 import errno
 import gzip
 import hashlib
@@ -633,12 +633,22 @@ import sys
 import zlib
 from pathlib import Path, PurePosixPath
 
-operation, root_text, *arguments = sys.argv[1:]
+operation, root_text, donor, *arguments = sys.argv[1:]
 root = Path(root_text)
 flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 def fail(message):
     raise SystemExit(f"unsafe recipient path: {message}")
+
+def deny(create):
+    # A permission refusal is the donor's to fix, not an unsafe path: typically a
+    # macOS privacy denial on ~/Downloads, or a read-only parent folder.
+    retry = " ".join(["genome-sync setup --dest DIR", donor]).strip()
+    raise SystemExit(
+        f"genome-sync could not {'create' if create else 'open'} {root}: permission denied.\n"
+        "On macOS, allow your terminal app to use the Downloads folder (System Settings → "
+        f"Privacy & Security → Files and Folders), or choose another folder: {retry}"
+    )
 
 def validate_relative(value):
     if not value or "\\" in value or "\x00" in value or "\t" in value or "\n" in value:
@@ -672,8 +682,12 @@ def open_root(create=False):
                     os.mkdir(part, mode=0o700, dir_fd=current_fd)
                 except FileExistsError:
                     pass
+                except PermissionError:
+                    deny(create)
             try:
                 child_fd = open_directory(part, current_fd)
+            except PermissionError:
+                deny(create)
             except OSError as error:
                 fail(f"destination ancestor is not a real directory: {part}: {error}")
             os.close(current_fd)
