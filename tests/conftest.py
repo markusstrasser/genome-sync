@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -14,7 +14,7 @@ import pytest
 class FakeGenomeSync:
     command: Path
     destination: Path
-    environment: dict[str, str]
+    environment: dict[str, str] = field(repr=False)
     config_file: Path
     donor: str
     payloads: dict[str, bytes]
@@ -147,6 +147,9 @@ if arguments[:2] == ["file", "download"]:
         print("injected fake B2 download failure", file=sys.stderr)
         raise SystemExit(9)
     shutil.copyfile(source, destination)
+    late_notice = os.environ.get("FAKE_B2_WITHDRAWAL_ON_RESULT_DOWNLOAD")
+    if late_notice and source.as_posix().endswith("stage_a/result.tsv"):
+        shutil.copyfile(late_notice, source.parent.parent / "_WITHDRAWN.json")
     raise SystemExit(0)
 raise SystemExit(f"unsupported fake b2 invocation: {arguments!r}")
 """,

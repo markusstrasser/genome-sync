@@ -72,10 +72,10 @@ SETUP AND UPDATES:
   Downloads are differential.
   Retention is the default: a previously managed file that is absent from the
   new active snapshot keeps its bytes but is moved to `_retained/` and recorded
-  in the manifest's `retained_files` map instead of `files`, so the live tree
-  always mirrors the active snapshot exactly. Deleting retained files is a
-  separate explicit choice — pass --prune when you want them removed. A later
-  snapshot that re-adds a retained file restores it from `_retained/` without
+  in the manifest's `retained_files` map instead of `files`. A complete,
+  validated sync makes the live tree mirror the active snapshot. Deleting
+  retained files is a separate explicit choice — pass --prune when you want
+  them removed. A later snapshot that re-adds a retained file restores it from `_retained/` without
   re-downloading.
   `genome-sync destination <directory>` changes only the saved destination. It
   uses the existing Keychain/Credential Locker entry and never moves or syncs
@@ -1134,6 +1134,7 @@ PRUNES="$CONTROL_DIR/prunes.txt"
 RELS="$CONTROL_DIR/remote-rels.txt"
 HASHES="$CONTROL_DIR/local-hashes.tsv"
 ACTIVE_RESULTS="$CONTROL_DIR/active-results.json"
+WITHDRAWALS="$TEMP_ROOT/.genome-withdrawals.json"
 LOCAL_INDEX="$CONTROL_DIR/local-content-index.tsv"
 SESSION_LOG="$CONTROL_DIR/sync.log"
 touch "$VERIFIED" "$FILTERED" "$OMITTED" "$TODO" "$PRUNES" "$HASHES" "$LOCAL_INDEX"
@@ -1231,8 +1232,15 @@ say "  ${D}Connected with verified B2 client ${B2_VERSION}.${X}"
 "${B2_RUN[@]}" ls --recursive --json "b2://${BUCKET}/${DONOR}/" > "$RAWJSON" \
   || { say "\n${R}  Could not list your files.${X}"; exit 1; }
 
-"${PY[@]}" - "$RAWJSON" "$DONOR" "$ONLY" "$EXCLUDE" "$BUCKET" "$CONTROL_DIR" "$B2_VERSION" "$DEST_ABS" "$ACTIVE_RESULTS" <<'PYEOF' > "$VERIFIED" \
-  || { say "\n${R}  The remote listing or activation evidence violated the donor contract.${X}"; exit 1; }
+persist_withdrawals() {
+  # A refusal must leave its currency notice beside the existing copy. The
+  # temporary file is inside the guarded destination; dry runs never install it.
+  if [ "$DRYRUN" -eq 0 ] && [ -f "$WITHDRAWALS" ]; then
+    fs_guard install ".genome-withdrawals.json" "$WITHDRAWALS" || return 1
+  fi
+}
+
+cat > "$CONTROL_DIR/verify-snapshot.py" <<'PYEOF'
 import hashlib
 import json
 import os
@@ -1255,6 +1263,7 @@ from pathlib import Path, PurePosixPath
     b2_version,
     destination_text,
     active_results_path_text,
+    withdrawals_path_text,
 ) = sys.argv
 payload = json.load(open(path, encoding="utf-8"))
 if not isinstance(payload, list):
@@ -1267,6 +1276,7 @@ RESULTS_RE = re.compile(r"^([^/]+)/results/(.+)$")
 control_dir = Path(control_dir_text)
 destination_root = Path(destination_text)
 active_results_path = Path(active_results_path_text)
+withdrawals_path = Path(withdrawals_path_text)
 ROOT_AGENT_ASSETS = ("AGENTS.md", "CLAUDE.md", "README.md")
 
 @dataclass(frozen=True)
@@ -1510,14 +1520,109 @@ def parse_authorized_at(value, *, prefix):
         raise SystemExit(f"results authorized_at must be timezone-aware: {prefix}")
     return parsed
 
+
+WITHDRAWAL_SCHEMA = "donor-results-withdrawal/v1"
+WITHDRAWAL_HISTORY_SCHEMA = "genome-sync-results-withdrawals/v1"
+withdrawal_fields = {
+    "schema_version", "sample_id", "donor_id", "assay_id", "plan_sha256",
+    "status", "reason", "withdrawn_at", "replacement_plan_sha256",
+}
+
+
+def validate_withdrawal(notice, *, assay):
+    if not isinstance(notice, dict) or set(notice) != withdrawal_fields:
+        raise SystemExit("results withdrawal has an unexpected schema")
+    if notice["schema_version"] != WITHDRAWAL_SCHEMA:
+        raise SystemExit("results withdrawal has the wrong contract")
+    if notice["donor_id"] != donor or notice["assay_id"] != assay:
+        raise SystemExit("results withdrawal identity differs from its donor/assay path")
+    canonical_segment(notice["sample_id"], field="withdrawal sample_id")
+    canonical_segment(assay, field="withdrawal assay_id")
+    require_sha256(notice["plan_sha256"], field="withdrawal plan_sha256")
+    parse_authorized_at(notice["withdrawn_at"], prefix="withdrawal withdrawn_at")
+    reason = notice["reason"]
+    if not isinstance(reason, str) or not reason.strip() or any(ord(char) < 32 for char in reason):
+        raise SystemExit("results withdrawal requires a nonblank, single-line reason")
+    if not isinstance(notice["status"], str) or notice["status"] not in {"withdrawn", "superseded"}:
+        raise SystemExit("results withdrawal has an invalid status")
+    replacement = notice["replacement_plan_sha256"]
+    if notice["status"] == "superseded":
+        require_sha256(replacement, field="withdrawal replacement_plan_sha256")
+        if replacement == notice["plan_sha256"]:
+            raise SystemExit("results withdrawal cannot supersede a plan with itself")
+    elif replacement != "":
+        raise SystemExit("withdrawn results must not name a replacement plan")
+    return notice
+
+
+def withdrawal_digest(notice):
+    return hashlib.sha256(
+        json.dumps(notice, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+withdrawal_history = {
+    "schema_version": WITHDRAWAL_HISTORY_SCHEMA,
+    "donor_id": donor,
+    "withdrawals": {},
+}
+history_path = destination_root / ".genome-withdrawals.json"
+if (not only or only == "results") and exclude != "results" and (history_path.exists() or history_path.is_symlink()):
+    withdrawal_history = strict_json(
+        read_regular(history_path, label="local withdrawal history"),
+        label="local withdrawal history",
+    )
+    if (
+        set(withdrawal_history) != {"schema_version", "donor_id", "withdrawals"}
+        or withdrawal_history["schema_version"] != WITHDRAWAL_HISTORY_SCHEMA
+        or withdrawal_history["donor_id"] != donor
+        or not isinstance(withdrawal_history["withdrawals"], dict)
+    ):
+        raise SystemExit("local withdrawal history has the wrong contract or donor")
+    for digest, notice in withdrawal_history["withdrawals"].items():
+        if not isinstance(notice, dict):
+            raise SystemExit("local withdrawal history contains a malformed notice")
+        validate_withdrawal(notice, assay=notice.get("assay_id"))
+        if digest != withdrawal_digest(notice):
+            raise SystemExit("local withdrawal history digest differs from its notice")
+
+
+def refuse_withdrawal(notice):
+    raise SystemExit(
+        f"results package {notice['status']}: assay={notice['assay_id']} "
+        f"plan={notice['plan_sha256']}; {notice['reason']}"
+    )
+
+
+def remember_withdrawal(notice):
+    withdrawal_history["withdrawals"][withdrawal_digest(notice)] = notice
+    withdrawals_path.write_text(
+        json.dumps(withdrawal_history, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    withdrawals_path.chmod(0o600)
+
+
 def resolve_results_activation(*, assay, group):
     """Validate one completion marker, root inventory, and exact stable remote set."""
 
     prefix = f"{assay}/results/"
     by_suffix = {remote.relative[len(prefix):]: remote for remote in group}
+    withdrawal_remote = by_suffix.pop("_WITHDRAWN.json", None)
+    withdrawal = None
+    if withdrawal_remote is not None:
+        withdrawal = validate_withdrawal(
+            strict_json(
+                capture_control(withdrawal_remote, label=f"results withdrawal {prefix}"),
+                label=f"results withdrawal {prefix}",
+            ),
+            assay=assay,
+        )
     marker = by_suffix.get("_COMPLETE.json")
     manifest = by_suffix.get("manifest.json")
     if marker is None or manifest is None:
+        if withdrawal is not None:
+            remember_withdrawal(withdrawal)
+            refuse_withdrawal(withdrawal)
         raise SystemExit(f"incomplete results plan prefix: {prefix}")
 
     marker_bytes = capture_control(marker, label=f"results activation marker {prefix}")
@@ -1557,6 +1662,16 @@ def resolve_results_activation(*, assay, group):
     ):
         raise SystemExit(f"results marker identity differs from its donor/sample path: {prefix}")
     sample_id = canonical_segment(marker_payload["sample_id"], field="results marker sample_id")
+    if withdrawal is not None:
+        if withdrawal["sample_id"] != sample_id:
+            raise SystemExit("results withdrawal sample differs from the activated package")
+        remember_withdrawal(withdrawal)
+    for notice in withdrawal_history["withdrawals"].values():
+        if notice["assay_id"] != assay or notice["plan_sha256"] != plan_sha256:
+            continue
+        if notice["sample_id"] != sample_id:
+            raise SystemExit("results withdrawal sample differs from the activated package")
+        refuse_withdrawal(notice)
     require_sha256(
         marker_payload["object_set_sha256"],
         field="results marker object_set_sha256",
@@ -1888,7 +2003,7 @@ def resolve_results_activation(*, assay, group):
         "logical_bytes",
         "logical_sha256",
     }
-    reserved_paths = {"_COMPLETE.json", "manifest.json"}
+    reserved_paths = {"_COMPLETE.json", "manifest.json", "_WITHDRAWN.json"}
     expected = {}
     encoded = {}
     root_object_bytes = 0
@@ -1997,7 +2112,7 @@ def resolve_results_activation(*, assay, group):
             prefix + relative_path: (prefix + logical_path, logical_bytes, logical_sha256)
             for relative_path, (logical_path, logical_bytes, logical_sha256) in encoded.items()
         },
-        group=tuple(group),
+        group=tuple(remote for remote in group if remote is not withdrawal_remote),
     )
 
 seen = set()
@@ -2211,6 +2326,15 @@ for remote, expected_sha256, local_relative, transport in sorted(
     )
 PYEOF
 
+verify_remote_snapshot() {
+  "${PY[@]}" "$CONTROL_DIR/verify-snapshot.py" "$RAWJSON" "$DONOR" "$ONLY" "$EXCLUDE" "$BUCKET" "$CONTROL_DIR" "$B2_VERSION" "$DEST_ABS" "$ACTIVE_RESULTS" "$WITHDRAWALS" > "$VERIFIED" \
+    || { persist_withdrawals || return 1; say "\n${R}  The remote listing or activation evidence violated the donor contract.${X}"; return 1; }
+  persist_withdrawals || return 1
+}
+verify_remote_snapshot || exit 1
+cp "$ACTIVE_RESULTS" "$CONTROL_DIR/initial-active-results.json" || exit 1
+cp "$VERIFIED" "$CONTROL_DIR/initial-verified.tsv" || exit 1
+
 verified_file_count=$(wc -l < "$VERIFIED" | tr -d ' ')
 verified_bytes=$(awk -F '\t' '{total += $2} END {printf "%.0f", total}' "$VERIFIED")
 say "  ${G}Verified remote snapshot:${X} ${verified_file_count} files, $(human "$verified_bytes")"
@@ -2277,7 +2401,7 @@ def canonical_relative(path: Path) -> "str | None":
         or any(part in {"", ".", ".."} for part in pure.parts)
     ):
         return None
-    if relative == manifest_name or pure.parts[0].startswith(".genome-download-tmp."):
+    if relative in {manifest_name, ".genome-withdrawals.json"} or pure.parts[0].startswith(".genome-download-tmp."):
         return None
     return relative
 
@@ -2522,6 +2646,55 @@ FREE_KB=$(df -Pk "$DEST_ABS" | awk 'NR==2{print $4}')
 if [ "${FREE_KB:-0}" -lt "${NEED_KB:-0}" ]; then
   say "\n${R}  Not enough free disk space.${X}"
   exit 1
+fi
+
+# Per-file updates can leave a mixed tree if a later download or currency check
+# fails. Invalidate the old claim before any selected results can be changed;
+# only the successful final recapture and manifest rebuild may certify it again.
+if [ -f "$DEST_ABS/$MANIFEST" ] && [ "$EXCLUDE" != "results" ] \
+  && { [ -z "$ONLY" ] || [ "$ONLY" = "results" ]; }; then
+  prior_manifest="$(mktemp "$TEMP_ROOT/prior-manifest.XXXXXX")" || exit 1
+  chmod 600 "$prior_manifest" || exit 1
+  fs_guard copy "$MANIFEST" "$prior_manifest" > /dev/null || exit 1
+  incomplete_manifest="$TEMP_ROOT/incomplete-manifest.json"
+  "${PY[@]}" - "$prior_manifest" "$incomplete_manifest" <<'PYEOF' \
+    || { say "${R}could not invalidate the prior results descriptor${X}"; exit 1; }
+import json
+import os
+import sys
+
+source_path, temporary_path = sys.argv[1:]
+with open(source_path, encoding="utf-8") as source:
+    manifest = json.load(source)
+if not isinstance(manifest, dict):
+    raise SystemExit("existing local manifest is malformed")
+materialization = manifest.get("materialization", {})
+active_results = manifest.get("active_results", {})
+if (
+    not isinstance(materialization, dict)
+    or type(materialization.get("complete", False)) is not bool
+    or not isinstance(active_results, dict)
+):
+    raise SystemExit("existing materialization state is malformed")
+for assay, record in active_results.items():
+    if not isinstance(record, dict) or any(
+        type(record.get(field, True)) is not bool
+        for field in ("remote_activation_validated", "local_materialization_complete")
+    ):
+        raise SystemExit(f"existing active result validation state is malformed for assay {assay}")
+    record["remote_activation_validated"] = False
+    record["local_materialization_complete"] = False
+materialization["complete"] = False
+manifest["materialization"] = materialization
+with open(temporary_path, "x", encoding="utf-8") as temporary:
+    json.dump(manifest, temporary, indent=2, sort_keys=True)
+    temporary.write("\n")
+    temporary.flush()
+    os.fsync(temporary.fileno())
+PYEOF
+  chmod 600 "$incomplete_manifest" || exit 1
+  fs_guard install "$MANIFEST" "$incomplete_manifest" || exit 1
+  log_event "results descriptor invalidated pending final verification"
 fi
 
 # One download worker: capture a single object into its own private temp under
@@ -2847,8 +3020,8 @@ if retained or retained_flagged_unavailable:
         "of deleting them (deletion is only ever the explicit `--prune` flag), but",
         "they are **outside the current activation**: never cite them as activated",
         "evidence, and never prefer them over a file of the same name in the live",
-        "tree. The live tree (everything outside `_retained/`) is exactly the",
-        "active snapshot.",
+        "tree. Only a validated, complete local materialization certifies that",
+        "the live tree outside `_retained/` matches the active snapshot.",
         "",
         "The authoritative inventory is `../.genome-manifest.json` → `retained_files`",
         "(each record carries `original_path`). Run `genome-sync --prune` to delete",
@@ -2871,8 +3044,9 @@ root_lines = [
     "# Active genome bundles",
     "",
     "This index is generated from `.genome-manifest.json`. Its `active_results`",
-    "map binds the verified remote activation for each assay. The manifest's",
+    "map identifies each assay's plan; require `remote_activation_validated=true` before treating local results as activated. The manifest's",
     "`materialization`, `omitted_files`, and `unavailable_files` fields say which activated bytes are local.",
+    "A false validation flag means an interrupted update may have mixed files; the old plan identity does not certify the tree. With validation true, a partial materialization permits only explicitly verified present files, never a whole-package completeness claim.",
     "`retained_files` lists kept files that the active snapshot no longer names; they live under `_retained/` and are not activated bytes.",
     "",
     "| Assay | Sample | Updated | Local | Results plan | Results index |",
@@ -2969,9 +3143,10 @@ for assay, record in sorted(active.items()):
         f"This directory is the assay container for sample `{record['sample_id']}`. Work read-only unless the donor explicitly asks for a local change.",
         "",
         "Read `../.genome-manifest.json` first. Its `active_results` entry identifies the exact plan and local results path. Then read `results/AGENTS.md` for the evidence and interpretation contract and `results/TOC.md` to locate stages.",
-        "The remote activation and the local materialization are separate facts. Check `materialization.complete`, `omitted_files`, and `unavailable_files` before claiming a payload is local.",
+        "Check `../.genome-withdrawals.json` if present before relying on results. A notice binding this assay and exact active `plan_sha256` means the package is withdrawn or superseded; report its reason and do not rely on its interpretations. Notices for earlier plans remain historical when a different verified plan is activated. Run `genome-sync` to refresh currency; an offline copy cannot learn a new remote withdrawal.",
+        "The remote activation and the local materialization are separate facts. Require `active_results[assay].remote_activation_validated=true` before treating local results as activated. A false validation flag means an interrupted update may have mixed files; neither the old plan identity nor the present tree is verified. Check `local_materialization_complete`, `materialization.complete`, `omitted_files`, and `unavailable_files` before claiming completeness. When validation is true but materialization is partial, use only explicitly verified present-file records and never claim the whole package is complete.",
         "`results/manifest.json` may list a large text file under its stored `.gz` name with `encoding`, `logical_path`, `logical_bytes`, and `logical_sha256`: it travelled gzip-compressed and only the decoded file exists here, at its `logical_path`, matching `logical_sha256`. Its `.genome-manifest.json` record names the stored object under `transport`.",
-        "Files under `_retained/` (manifest `retained_files`) are kept local bytes from an earlier snapshot; they are outside the current activation, so never cite them as activated evidence. Everything outside `_retained/` is exactly the active snapshot. `unavailable_files` entries flagged `retained` describe those leftovers too, and are excluded from every `materialization` count.",
+        "Files under `_retained/` (manifest `retained_files`) are kept local bytes from an earlier snapshot; they are outside the current activation, so never cite them as activated evidence. Only validated, complete materialization certifies the live tree as the active snapshot. `unavailable_files` entries flagged `retained` describe those leftovers too, and are excluded from every `materialization` count.",
         "",
         "Treat `lab/` as sequencing evidence, not interpretation. Validate `lab/lab_manifest.json` and `lab/_COMPLETE.json` before relying on it. Never upload donor-specific sequence, variants, genotypes, or findings to a network service without explicit informed permission.",
         "",
@@ -3011,8 +3186,8 @@ if [ "$prune_n" -gt 0 ] && [ "$PRUNE" -eq 1 ]; then
   fi
 elif [ "$prune_n" -gt 0 ]; then
   # Retention keeps the bytes but takes them out of the live tree: everything
-  # under the destination outside `_retained/` is exactly the active snapshot,
-  # so a later reader never mistakes a dropped file for activated evidence.
+  # under the destination outside `_retained/` matches the active snapshot only
+  # after final verification; the prior descriptor stays invalid until then.
   if [ "$move_n" -gt 0 ]; then
     say "\n  ${Y}Retiring ${move_n} file(s) no longer in the active snapshot to _retained/:${X}"
   else
@@ -3037,6 +3212,19 @@ elif [ "$prune_n" -gt 0 ]; then
 fi
 
 fs_guard validate-tree || exit 1
+if [ "$(tr -d '[:space:]' < "$ACTIVE_RESULTS")" != "{}" ]; then
+  # Results may have been withdrawn while payloads were in flight. Recapture
+  # their control evidence before committing a local activation descriptor.
+  "${B2_RUN[@]}" ls --recursive --json "b2://${BUCKET}/${DONOR}/" > "$RAWJSON" \
+    || { say "${R}Could not recheck package currency; local activation withheld.${X}"; exit 1; }
+  verify_remote_snapshot || exit 1
+  if ! cmp -s "$CONTROL_DIR/initial-active-results.json" "$ACTIVE_RESULTS" \
+    || ! cmp -s "$CONTROL_DIR/initial-verified.tsv" "$VERIFIED"; then
+    say "${R}The remote snapshot changed during download; local activation withheld. Run genome-sync again.${X}"
+    exit 1
+  fi
+fi
+
 manifest_temporary="$TEMP_ROOT/manifest.json"
 "${PY[@]}" - "$manifest_temporary" "$DONOR" "$BUCKET" "$VERIFIED" "$FILTERED" "$OMITTED" "$HASHES" "$DEST_ABS/$MANIFEST" "$ONLY" "$EXCLUDE" "$ACTIVE_RESULTS" "$DEST_ABS" "$PRUNE" <<'PYEOF' \
   || { say "${R}could not build a complete local manifest${X}"; exit 1; }
@@ -3339,8 +3527,8 @@ merged_files.update(observed)
 
 # Retention is the default. Previously managed bytes that the new active snapshot
 # no longer names stay on disk unless --prune was given — but OUT of the live
-# tree: the sync loop moved them under `_retained/`, so everything outside the
-# attic is exactly the active snapshot. Records are keyed by their attic path
+# tree: the sync loop moved them under `_retained/`. Only a validated, complete
+# descriptor certifies the live tree. Records are keyed by their attic path
 # (the on-disk location) and carry `original_path` for identity.
 ATTIC_PREFIX = "_retained/"
 
@@ -3528,6 +3716,7 @@ payload = {
     "active_results": dict(sorted(active_results.items())),
     "protected_local_paths": [
         "TOC.md",
+        ".genome-withdrawals.json",
         *[
             f"{assay}/{filename}"
             for assay in sorted(active_results)
@@ -3537,7 +3726,10 @@ payload = {
     ],
     "file_count": len(merged_files),
     "materialization": {
-        "complete": not merged_omitted and not merged_unavailable,
+        "complete": not merged_omitted and not merged_unavailable and all(
+            record["remote_activation_validated"] and record["local_materialization_complete"]
+            for record in active_results.values()
+        ),
         "verified_remote_file_count": (
             len(merged_files) + len(merged_omitted) + len(merged_unavailable)
         ),

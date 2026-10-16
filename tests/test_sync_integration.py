@@ -13,7 +13,6 @@ from pathlib import Path
 
 import pexpect
 import pytest
-
 from conftest import FakeGenomeSync
 
 
@@ -1012,6 +1011,383 @@ def _results_dir(client: FakeGenomeSync) -> Path:
     return client.destination / ASSAY / "results"
 
 
+def _write_results_withdrawal(
+    client: FakeGenomeSync,
+    *,
+    status: str = "withdrawn",
+    replacement_plan_sha256: str = "",
+    **overrides: object,
+) -> dict[str, object]:
+    remote = Path(client.environment["FAKE_B2_ROOT"]) / client.donor / ASSAY / "results"
+    marker = json.loads((remote / "_COMPLETE.json").read_text())
+    withdrawal = {
+        "schema_version": "donor-results-withdrawal/v1",
+        "sample_id": marker["sample_id"],
+        "donor_id": marker["donor_id"],
+        "assay_id": marker["assay_id"],
+        "plan_sha256": marker["plan_sha256"],
+        "status": status,
+        "reason": "The interpretation needs correction; do not rely on this package.",
+        "withdrawn_at": "2026-10-15T00:00:00Z",
+        "replacement_plan_sha256": replacement_plan_sha256,
+    }
+    withdrawal.update(overrides)
+    (remote / "_WITHDRAWN.json").write_text(json.dumps(withdrawal, sort_keys=True) + "\n")
+    return withdrawal
+
+
+def test_fixture_repr_excludes_environment_without_changing_subprocess_values() -> None:
+    client = FakeGenomeSync(
+        command=Path("/synthetic/client"),
+        destination=Path("/synthetic/destination"),
+        environment={"TEST_ONLY_SECRET": "fixture-sensitive-sentinel"},
+        config_file=Path("/synthetic/config"),
+        donor="synthetic",
+        payloads={},
+    )
+    assert "fixture-sensitive-sentinel" not in repr(client)
+    assert client.environment["TEST_ONLY_SECRET"] == "fixture-sensitive-sentinel"
+
+
+@pytest.mark.parametrize("status", ["withdrawn", "superseded"])
+def test_withdrawn_results_refuse_with_reason_and_retain_local_notice(
+    fake_genome_sync: FakeGenomeSync,
+    status: str,
+) -> None:
+    client = fake_genome_sync
+    _write_results_snapshot(client, [_plain("stage_a/result.tsv", b"prior interpretation")])
+    assert _sync_results(client).returncode == 0
+    prior_manifest = (client.destination / ".genome-manifest.json").read_bytes()
+    withdrawal = _write_results_withdrawal(
+        client,
+        status=status,
+        replacement_plan_sha256="9" * 64 if status == "superseded" else "",
+    )
+
+    completed = _sync_results(client)
+
+    assert completed.returncode != 0
+    assert status in completed.stderr
+    assert str(withdrawal["reason"]) in completed.stderr
+    assert (client.destination / ".genome-manifest.json").read_bytes() == prior_manifest
+    assert (_results_dir(client) / "stage_a/result.tsv").read_bytes() == b"prior interpretation"
+    notices = json.loads((client.destination / ".genome-withdrawals.json").read_text())
+    assert withdrawal in notices["withdrawals"].values()
+    assert (client.destination / ".genome-withdrawals.json").stat().st_mode & 0o077 == 0
+    assert ".genome-withdrawals.json" in (client.destination / ASSAY / "AGENTS.md").read_text()
+
+
+def test_withdrawal_without_completion_is_recorded_and_reported(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _write_results_snapshot(client, [_plain("stage_a/result.tsv", b"withdrawn")])
+    withdrawal = _write_results_withdrawal(client)
+    remote = Path(client.environment["FAKE_B2_ROOT"]) / client.donor / ASSAY / "results"
+    (remote / "_COMPLETE.json").unlink()
+    (remote / "manifest.json").unlink()
+
+    completed = _sync_results(client)
+
+    assert completed.returncode != 0
+    assert str(withdrawal["reason"]) in completed.stderr
+    notices = json.loads((client.destination / ".genome-withdrawals.json").read_text())
+    assert withdrawal in notices["withdrawals"].values()
+    assert not (_results_dir(client) / "stage_a/result.tsv").exists()
+
+
+def test_recorded_withdrawal_blocks_old_descriptor_after_remote_notice_disappears(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _write_results_snapshot(client, [_plain("stage_a/result.tsv", b"withdrawn")])
+    withdrawal = _write_results_withdrawal(client)
+    assert _sync_results(client).returncode != 0
+    remote = Path(client.environment["FAKE_B2_ROOT"]) / client.donor / ASSAY / "results"
+    (remote / "_WITHDRAWN.json").unlink()
+
+    completed = _sync_results(client)
+
+    assert completed.returncode != 0
+    assert str(withdrawal["reason"]) in completed.stderr
+    assert not (_results_dir(client) / "stage_a/result.tsv").exists()
+
+
+def test_new_plan_can_install_while_prior_withdrawal_is_preserved(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _write_results_snapshot(client, [_plain("stage_a/result.tsv", b"withdrawn")])
+    withdrawal = _write_results_withdrawal(client)
+    assert _sync_results(client).returncode != 0
+    _write_results_snapshot(
+        client,
+        [_plain("stage_a/result.tsv", b"corrected interpretation")],
+        published_at="2026-10-16T00:00:00Z",
+    )
+    remote = Path(client.environment["FAKE_B2_ROOT"]) / client.donor / ASSAY / "results"
+    (remote / "_WITHDRAWN.json").write_text(json.dumps(withdrawal) + "\n")
+
+    completed = _sync_results(client, "--prune")
+
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    assert (_results_dir(client) / "stage_a/result.tsv").read_bytes() == b"corrected interpretation"
+    notices = json.loads((client.destination / ".genome-withdrawals.json").read_text())
+    assert withdrawal in notices["withdrawals"].values()
+
+
+def test_withdrawal_dry_run_reports_reason_without_retaining_notice(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _write_results_snapshot(client, [_plain("stage_a/result.tsv", b"withdrawn")])
+    withdrawal = _write_results_withdrawal(client)
+
+    completed = _sync_results(client, "--dry-run")
+
+    assert completed.returncode != 0
+    assert str(withdrawal["reason"]) in completed.stderr
+    assert not (client.destination / ".genome-withdrawals.json").exists()
+    assert not (_results_dir(client) / "stage_a/result.tsv").exists()
+
+
+def test_withdrawal_during_download_refuses_local_activation(
+    fake_genome_sync: FakeGenomeSync,
+    tmp_path: Path,
+) -> None:
+    client = fake_genome_sync
+    _write_results_snapshot(client, [_plain("stage_a/result.tsv", b"withdrawn during transfer")])
+    withdrawal = _write_results_withdrawal(client)
+    remote = Path(client.environment["FAKE_B2_ROOT"]) / client.donor / ASSAY / "results"
+    (remote / "_WITHDRAWN.json").unlink()
+    late_notice = tmp_path / "withdraw-after-download.json"
+    late_notice.write_text(json.dumps(withdrawal))
+
+    completed = _sync_results(
+        client,
+        environment={**client.environment, "FAKE_B2_WITHDRAWAL_ON_RESULT_DOWNLOAD": str(late_notice)},
+    )
+
+    assert completed.returncode != 0
+    assert str(withdrawal["reason"]) in completed.stderr
+    assert not (client.destination / ".genome-manifest.json").exists()
+    notices = json.loads((client.destination / ".genome-withdrawals.json").read_text())
+    assert withdrawal in notices["withdrawals"].values()
+
+
+@pytest.mark.parametrize("prune", [False, True])
+def test_failed_replacement_invalidates_prior_descriptor_until_results_reverified(
+    fake_genome_sync: FakeGenomeSync,
+    tmp_path: Path,
+    prune: bool,
+) -> None:
+    client = fake_genome_sync
+    old_payload = b"previous interpretation"
+    _write_results_snapshot(
+        client,
+        [_plain("stage_a/result.tsv", old_payload), _plain("stage_a/old-only.tsv", b"old only")],
+    )
+    assert _sync_results(client).returncode == 0
+    previous = _manifest(client)
+    guide = (client.destination / ASSAY / "AGENTS.md").read_text()
+    assert "remote_activation_validated=true" in guide
+    assert "When validation is true but materialization is partial" in guide
+    _write_results_snapshot(
+        client,
+        [_plain("stage_a/result.tsv", b"replacement interpretation")],
+        published_at="2026-10-16T00:00:00Z",
+    )
+    withdrawal = _write_results_withdrawal(client)
+    remote = Path(client.environment["FAKE_B2_ROOT"]) / client.donor / ASSAY / "results"
+    (remote / "_WITHDRAWN.json").unlink()
+    late_notice = tmp_path / "withdraw-replacement.json"
+    late_notice.write_text(json.dumps(withdrawal))
+
+    failed = _sync_results(
+        client,
+        *(('--prune',) if prune else ()),
+        environment={**client.environment, "FAKE_B2_WITHDRAWAL_ON_RESULT_DOWNLOAD": str(late_notice)},
+    )
+
+    assert failed.returncode != 0
+    assert str(withdrawal["reason"]) in failed.stderr
+    assert (_results_dir(client) / "stage_a/result.tsv").read_bytes() != old_payload
+    incomplete = _manifest(client)
+    assert incomplete["materialization"]["complete"] is False
+    assert incomplete["active_results"][ASSAY]["local_materialization_complete"] is False
+    assert incomplete["active_results"][ASSAY]["remote_activation_validated"] is False
+    assert incomplete["active_results"][ASSAY]["plan_sha256"] == previous["active_results"][ASSAY]["plan_sha256"]
+    assert incomplete["files"] == previous["files"]
+
+    # An independent lab-only update cannot recertify an interrupted results tree.
+    lab = _run(client, "--dest", str(client.destination), "--only", "lab", "--yes", client.donor)
+    assert lab.returncode == 0, lab.stderr + lab.stdout
+    assert _manifest(client)["materialization"]["complete"] is False
+    assert _manifest(client)["active_results"][ASSAY]["remote_activation_validated"] is False
+
+    _write_results_snapshot(
+        client,
+        [_plain("stage_a/result.tsv", b"verified correction")],
+        published_at="2026-10-17T00:00:00Z",
+    )
+    corrected = _sync_results(client)
+    assert corrected.returncode == 0, corrected.stderr + corrected.stdout
+    complete = _manifest(client)
+    assert complete["materialization"]["complete"] is True
+    assert complete["active_results"][ASSAY]["local_materialization_complete"] is True
+    assert complete["active_results"][ASSAY]["remote_activation_validated"] is True
+
+
+@pytest.mark.parametrize("malformed", ["materialization", "active_result"])
+def test_malformed_prior_validation_state_refuses_before_results_replacement(
+    fake_genome_sync: FakeGenomeSync,
+    malformed: str,
+) -> None:
+    client = fake_genome_sync
+    old_payload = b"previous interpretation"
+    _write_results_snapshot(client, [_plain("stage_a/result.tsv", old_payload)])
+    assert _sync_results(client).returncode == 0
+    manifest_path = client.destination / ".genome-manifest.json"
+    previous = _manifest(client)
+    if malformed == "materialization":
+        previous["materialization"]["complete"] = "true"
+    else:
+        previous["active_results"][ASSAY]["remote_activation_validated"] = "true"
+    manifest_path.write_text(json.dumps(previous) + "\n")
+    malformed_bytes = manifest_path.read_bytes()
+    _write_results_snapshot(
+        client,
+        [_plain("stage_a/result.tsv", b"replacement interpretation")],
+        published_at="2026-10-17T00:00:00Z",
+    )
+
+    failed = _sync_results(client)
+
+    assert failed.returncode != 0
+    assert "malformed" in failed.stdout + failed.stderr
+    assert manifest_path.read_bytes() == malformed_bytes
+    assert (_results_dir(client) / "stage_a/result.tsv").read_bytes() == old_payload
+    _assert_no_temp_left(client)
+
+
+def test_lab_only_cannot_revalidate_intact_interrupted_results(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _write_results_snapshot(client, [_plain("stage_a/result.tsv", b"intact interpretation")])
+    assert _sync_results(client).returncode == 0
+    manifest = _manifest(client)
+    manifest["materialization"]["complete"] = False
+    manifest["active_results"][ASSAY]["remote_activation_validated"] = False
+    manifest["active_results"][ASSAY]["local_materialization_complete"] = False
+    (client.destination / ".genome-manifest.json").write_text(json.dumps(manifest) + "\n")
+
+    lab = _run(client, "--dest", str(client.destination), "--only", "lab", "--yes", client.donor)
+
+    assert lab.returncode == 0, lab.stderr + lab.stdout
+    carried = _manifest(client)
+    assert carried["materialization"]["omitted_file_count"] == 0
+    assert carried["materialization"]["unavailable_file_count"] == 0
+    assert carried["materialization"]["complete"] is False
+    assert carried["active_results"][ASSAY]["remote_activation_validated"] is False
+    assert carried["active_results"][ASSAY]["local_materialization_complete"] is False
+
+
+@pytest.mark.parametrize("selection", ["lab", "ensemble", "exclude_results", "dry_run", "cancel"])
+def test_results_validation_survives_without_an_accepted_results_update(
+    fake_genome_sync: FakeGenomeSync,
+    selection: str,
+) -> None:
+    client = fake_genome_sync
+    old_payload = b"previous interpretation"
+    _write_results_snapshot(client, [_plain("stage_a/result.tsv", old_payload)])
+    assert _sync_results(client).returncode == 0
+    manifest_path = client.destination / ".genome-manifest.json"
+    prior_bytes = manifest_path.read_bytes()
+    prior_active = _manifest(client)["active_results"][ASSAY]
+    _write_results_snapshot(
+        client,
+        [_plain("stage_a/result.tsv", b"replacement interpretation")],
+        published_at="2026-10-17T00:00:00Z",
+    )
+    if selection == "cancel":
+        cancelled = pexpect.spawn(
+            str(client.command),
+            ["--dest", str(client.destination), "--only", "results", client.donor],
+            env=client.environment,
+            encoding="utf-8",
+            timeout=15,
+        )
+        cancelled.expect(r"Apply this verified update\?.*\[Y/n\]")
+        cancelled.sendline("n")
+        cancelled.expect("No files changed")
+        cancelled.expect(pexpect.EOF)
+        cancelled.close()
+        assert cancelled.exitstatus == 0
+    else:
+        arguments = {
+            "lab": ("--only", "lab"),
+            "ensemble": ("--only", "ensemble"),
+            "exclude_results": ("--exclude", "results"),
+            "dry_run": ("--only", "results", "--dry-run"),
+        }[selection]
+        completed = _run(
+            client, "--dest", str(client.destination), *arguments, "--yes", client.donor
+        )
+        assert completed.returncode == 0, completed.stderr + completed.stdout
+
+    assert (_results_dir(client) / "stage_a/result.tsv").read_bytes() == old_payload
+    assert _manifest(client)["active_results"][ASSAY] == prior_active
+    assert _manifest(client)["materialization"]["complete"] is True
+    if selection in {"dry_run", "cancel"}:
+        assert manifest_path.read_bytes() == prior_bytes
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"donor_id": "OTHER"},
+        {"assay_id": "other"},
+        {"sample_id": "other-sample"},
+        {"plan_sha256": "bad"},
+        {"status": ["withdrawn"]},
+        {"reason": " "},
+        {"reason": "unsafe\nmessage"},
+        {"withdrawn_at": "2026-10-15T00:00:00"},
+        {"status": "superseded", "replacement_plan_sha256": ""},
+    ],
+)
+def test_malformed_or_wrong_scope_withdrawal_refuses_without_recording_it(
+    fake_genome_sync: FakeGenomeSync,
+    changes: dict,
+) -> None:
+    client = fake_genome_sync
+    _write_results_snapshot(client, [_plain("stage_a/result.tsv", b"should not download")])
+    _write_results_withdrawal(client, **changes)
+
+    completed = _sync_results(client)
+
+    assert completed.returncode != 0
+    assert "withdrawal" in completed.stderr
+    assert "Traceback" not in completed.stderr
+    assert not (client.destination / ".genome-withdrawals.json").exists()
+    assert not (_results_dir(client) / "stage_a/result.tsv").exists()
+
+
+def test_lab_only_still_syncs_when_results_are_withdrawn(
+    fake_genome_sync: FakeGenomeSync,
+) -> None:
+    client = fake_genome_sync
+    _write_results_snapshot(client, [_plain("stage_a/result.tsv", b"withdrawn")])
+    _write_results_withdrawal(client)
+
+    completed = _run(client, "--dest", str(client.destination), "--only", "lab", "--yes", client.donor)
+
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    assert (client.destination / "shortread/lab/payload-1.bin").exists()
+    assert not (client.destination / ".genome-withdrawals.json").exists()
+
+
 def _assert_no_temp_left(client: FakeGenomeSync) -> None:
     assert not list(client.destination.glob(".genome-download-tmp.*"))
 
@@ -1136,7 +1512,7 @@ def test_v4_wrong_logical_sha256_fails_closed_and_keeps_existing_files(
     _write_results_snapshot(client, _v4_objects())
     assert _sync_results(client).returncode == 0
     local_manifest = client.destination / ".genome-manifest.json"
-    manifest_before = local_manifest.read_bytes()
+    manifest_before = _manifest(client)
     results = _results_dir(client)
     payloads_before = {
         path: (results / path).read_bytes()
@@ -1157,7 +1533,14 @@ def test_v4_wrong_logical_sha256_fails_closed_and_keeps_existing_files(
     for path, content in payloads_before.items():
         assert (results / path).read_bytes() == content, path
     assert not (results / "stage_a/big.tsv.gz").exists()
-    assert local_manifest.read_bytes() == manifest_before
+    incomplete = json.loads(local_manifest.read_text())
+    assert incomplete["materialization"]["complete"] is False
+    assert incomplete["active_results"][ASSAY]["remote_activation_validated"] is False
+    assert incomplete["active_results"][ASSAY]["local_materialization_complete"] is False
+    manifest_before["materialization"]["complete"] = False
+    manifest_before["active_results"][ASSAY]["remote_activation_validated"] = False
+    manifest_before["active_results"][ASSAY]["local_materialization_complete"] = False
+    assert incomplete == manifest_before
     _assert_no_temp_left(client)
 
 

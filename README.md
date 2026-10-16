@@ -96,13 +96,40 @@ carried from a section outside the current sync are rehashed before being
 carried forward; missing or corrupt files move to `unavailable_files` and force
 materialization incomplete.
 
+The client checks package currency before downloading results and rechecks the
+activation evidence before writing the local descriptor. A remote
+`<assay>/results/_WITHDRAWN.json` names the exact withdrawn or superseded plan and
+its reason. Sync refuses that plan and preserves the notice privately in
+`.genome-withdrawals.json`, even when `_COMPLETE.json` has been removed. A notice
+already observed locally continues to block that same plan if the remote notice
+later disappears. `--dry-run` reports the refusal without recording it.
+
+Notices remain as history when a different verified plan replaces the withdrawn
+one, and `--prune` does not delete them. Read this file together with the exact
+`active_results[assay].plan_sha256` before interpreting a local copy. Raw/lab-only
+sync is independent of results withdrawal. An offline copy cannot learn a
+withdrawal until it reconnects. Downloads replace individual files; a failed
+final currency check leaves no new activation descriptor and does not promise
+an atomic rollback of already transferred files. Before changing selected
+results, the client atomically marks the prior descriptor's global
+`materialization.complete` and prior active-result validation/materialization
+flags false, retaining the old plan identities and file records as history.
+An interrupted update may leave mixed bytes: require
+`active_results[assay].remote_activation_validated=true` before treating local
+results as activated. A false completeness flag forbids a whole-package
+completeness claim; when remote validation is true, explicitly verified present
+files remain usable under the partial-materialization rules. Only a successful
+results recheck and hash-based descriptor rebuild restore validation and
+completeness. Lab-only updates cannot recertify interrupted results.
+
 Retention is the default, and retained files live in a **retention attic**. A
 previously managed file that the new active snapshot no longer names keeps its
 bytes but is moved to `_retained/<original path>` and recorded in
-`retained_files` (keyed by attic path, carrying `original_path`) — so the live
-tree outside `_retained/` is always exactly the active snapshot, and a later
-reader (human or agent) can never mistake a dropped file for activated
-evidence. `_retained/README.md` states this in place. A snapshot that re-adds a
+`retained_files` (keyed by attic path, carrying `original_path`). After a
+validated, complete sync the live tree outside `_retained/` matches the active
+snapshot. Readers must check the descriptor flags before relying on that claim;
+retained bytes are outside the activation. `_retained/README.md` states this in
+place. A snapshot that re-adds a
 retained file restores it from the attic without re-downloading. Deleting
 retained bytes is a separate explicit choice:
 
